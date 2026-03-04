@@ -1,0 +1,211 @@
+LSTM STOCK PREDICTOR — FULL SYSTEM DESCRIPTION
+===============================================
+
+OVERVIEW
+--------
+This project is an end-to-end machine learning pipeline for predicting stock
+price direction across four time horizons (1 day, 1 week, 1 month, 6 months).
+It downloads market and alternative data, engineers features, trains a deep
+learning model with rigorous sanity checks, then backtests a trading strategy
+against market and random baselines with a statistical significance test.
+
+
+FILES AND THEIR ROLES
+---------------------
+
+main.py — CLI Orchestrator
+  Entry point for the entire system. Parses command-line arguments and routes
+  execution to training phases or backtesting. Supports running the full
+  pipeline end-to-end (--all) or individual steps (--phase 1/2/3, --backtest).
+  Responsible for: wiring all modules together, exposing all user-facing
+  configuration options, loading a saved model for standalone backtest runs.
+
+data_engineering.py — Data & Feature Pipeline
+  Handles everything from raw download to ready-to-train arrays.
+  Key responsibilities:
+    - Downloading OHLCV price data via yfinance
+    - Computing technical indicators (moving averages, returns, volatility,
+      volume ratios, high-low range, calendar features)
+    - Fetching alternative data: insider transactions and news sentiment
+      (both free via yfinance with no API key required)
+    - Scoring news headlines with VADER NLP (local, no external API)
+    - Generating four binary target variables (one per time horizon)
+    - Building sliding window arrays: each sample is a (window_size x n_features)
+      tensor representing the past 20 trading days
+    - Splitting data chronologically (80% train / 20% test, no shuffling)
+    - Standard-scaling features: scaler fit on train only, applied to test
+    - Assembling a consolidated multi-ticker dataset dictionary
+
+model.py — Neural Network Definition & Inference
+  Defines the model architecture and the Monte Carlo inference function.
+  Architecture:
+    - Input: (window_size=20, n_features=24) tensor
+    - Conv1D with causal padding: detects short-term local patterns without
+      looking into the future
+    - BatchNormalization: stabilises training
+    - MCDropout (custom layer): dropout that stays ON during inference,
+      enabling uncertainty estimation
+    - LSTM: captures sequential dependencies across the 20-day window
+    - BatchNormalization + MCDropout again
+    - 4 independent Dense(1, sigmoid) output heads: one per horizon
+      (out_1d, out_5d, out_21d, out_126d), each predicting P(price goes up)
+  MCDropout inference (mc_predict):
+    - Runs 50 forward passes on the same input with dropout active
+    - Returns mean probability (the forecast) and std (the uncertainty)
+      for each of the 4 horizon heads
+
+training.py — 3-Phase Training Workflow
+  Implements a deliberate validation sequence before committing to real training.
+
+  Phase 1 — Direct Target Leak (1 epoch):
+    The binary targets themselves are injected into the input features.
+    The model is given the answers. Expected accuracy ~100% on all 4 heads.
+    Purpose: proves the data pipeline, window construction, and model I/O
+    plumbing are all correct. If this fails, something is fundamentally broken.
+
+  Phase 2 — Indirect Target Leak (50 epochs):
+    Targets are removed but the four future closing prices are included instead.
+    The model must infer direction from those future prices. Expected high accuracy.
+    Purpose: validates that the architecture is capable of learning a signal.
+    If this fails, the model is too weak or misconfigured.
+
+  Phase 3 — Real Training (200 epochs):
+    Clean features only — no future data of any kind. No early stopping.
+    This is the legitimate training run. The model is saved as a .keras file
+    for use in backtesting.
+
+backtesting.py — Strategy Evaluation & Statistical Testing
+  Applies the trained model to the test set and measures strategy performance.
+
+  Step 1 — Monte Carlo Predictions:
+    Runs mc_predict() to get mean P(up) and uncertainty for each stock/day/horizon.
+
+  Step 2 — Risk-Adjusted Scoring:
+    For each horizon h, computes:
+      score_h = (P(up) / h_days) - lambda_penalty * (uncertainty / h_days)
+    Dividing by h_days normalises scores across horizons (so a 6-month
+    prediction isn't unfairly penalised for being further away).
+    Selects the best horizon per stock per day. A buy signal fires when
+    best_score > 0 AND P(up) >= buy_threshold.
+
+  Step 3 — Sector-Diversified Top-3 Strategy:
+    Each day, selects up to 3 stocks with at most 1 per sector.
+    Sector constraints use a hardcoded map for the 15 default tickers.
+    Returns are normalised to daily-equivalent so 1-day and 126-day
+    positions are directly comparable in portfolio performance terms.
+
+  Step 4 — Baselines:
+    S&P 500: buy SPY at the start of the test period, hold to the end.
+    Random: pick 3 random stocks every day, 1,000 independent simulations.
+    This creates a distribution of returns achievable purely by chance.
+
+  Step 5 — 3-Sigma Test:
+    Z = (strategy_return - random_mean) / random_std
+    If Z >= 3, the strategy's outperformance is statistically significant
+    at the 99.7% confidence level (p < 0.003).
+
+  Output:
+    Prints a full results table. Saves backtest_results.png with:
+      - Cumulative return chart: strategy vs S&P 500 vs random cloud
+      - Return distribution histogram: strategy result vs 3σ threshold
+
+
+TECHNOLOGIES AND THEIR PURPOSES
+--------------------------------
+
+yfinance (yfinance>=0.2.36)
+  Purpose: Primary data source.
+  Used for: downloading OHLCV price data, insider transaction records,
+  and recent news article metadata — all free with no API key required.
+
+pandas (pandas>=2.0.0)
+  Purpose: Tabular data manipulation throughout the pipeline.
+  Used for: storing per-ticker DataFrames, computing rolling statistics,
+  aligning dates across datasets, grouping predictions by trading day.
+
+numpy (numpy>=1.24.0)
+  Purpose: Numerical array operations.
+  Used for: constructing sliding window tensors (3D arrays), stacking
+  Monte Carlo forward pass results, computing cumulative returns,
+  aggregating multi-ticker arrays.
+
+scikit-learn (scikit-learn>=1.3.0)
+  Purpose: Feature preprocessing.
+  Used for: StandardScaler — fits on training data only, transforms both
+  train and test windows to zero-mean unit-variance features.
+
+TensorFlow / Keras (tensorflow>=2.13.0)
+  Purpose: Deep learning framework.
+  Used for: defining the Conv1D → LSTM multi-output model, training across
+  all 4 horizon heads simultaneously with binary_crossentropy losses,
+  saving and loading the model in .keras format, running inference.
+  The custom MCDropout layer overrides Keras's standard dropout to keep it
+  active at inference time.
+
+vaderSentiment (vaderSentiment>=3.3.2)
+  Purpose: Sentiment analysis of news headlines.
+  Used for: scoring each news article title with a compound sentiment score
+  (-1 to +1) locally, without any external API call. Aggregated daily per
+  ticker as News_Sentiment (mean) and News_Count.
+
+matplotlib (matplotlib>=3.7.0)
+  Purpose: Visualisation.
+  Used for: generating the two-panel backtest results chart showing
+  cumulative returns and the random return distribution with the 3σ marker.
+
+scipy (scipy>=1.11.0)
+  Purpose: Statistical analysis.
+  Used for: computing the normal CDF in the 3-sigma test to convert the
+  Z-score to a p-value (scipy.stats.norm.cdf).
+
+
+DATA FLOW SUMMARY
+-----------------
+
+  yfinance download
+       ↓
+  pandas DataFrames per ticker
+       ↓
+  Technical indicators (numpy / pandas rolling ops)
+       ↓
+  Alternative data: insider + VADER sentiment (yfinance + vaderSentiment)
+       ↓
+  Binary targets for 4 horizons (pandas shift)
+       ↓
+  StandardScaler fit on train (scikit-learn)
+       ↓
+  Sliding window numpy arrays (n_samples × 20 × 24)
+       ↓
+  TensorFlow/Keras training across 4 output heads
+       ↓
+  Monte Carlo inference (50 passes, MCDropout active)
+       ↓
+  Risk-adjusted scores → buy signals → sector-diversified top-3
+       ↓
+  Cumulative returns vs S&P 500 vs 1000 random simulations
+       ↓
+  3-sigma Z-test (scipy) + matplotlib chart saved to disk
+
+
+LIMITATIONS AND DESIGN CHOICES
+--------------------------------
+
+- Chronological split: no data shuffling anywhere. The scaler is fit only on
+  training rows to prevent information leakage from the test period.
+
+- News sentiment limitation: yfinance returns only ~20 recent articles per
+  ticker, so News_Sentiment is 0 for most historical rows. It adds value for
+  live/recent-date inference but contributes little during historical training.
+
+- Insider data depth varies by ticker and by what yfinance happens to have
+  cached. Missing data falls back to zeros silently.
+
+- The last 126 rows per ticker are always dropped from the dataset because
+  the 126-day forward target cannot be computed for them.
+
+- No early stopping in Phase 3 by design: the goal is to learn maximum signal
+  from the data without stopping prematurely based on validation noise.
+
+- Sector map is hardcoded for the 15 default tickers. Custom tickers not in
+  the map are each treated as their own sector (ticker name used as sector key),
+  which means they can all appear in the top-3 simultaneously.

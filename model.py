@@ -1,12 +1,15 @@
 """
 Neural Network Model
-Conv1D → LSTM → Monte Carlo Dropout → Binary classification
+Shared Conv1D → LSTM backbone with 4 independent sigmoid output heads,
+one per time horizon (1d, 5d, 21d, 126d).
+Monte Carlo Dropout active at inference time for uncertainty estimation.
 """
 
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+from data_engineering import HORIZONS
 
 
 # ---------------------------------------------------------------------------
@@ -21,7 +24,6 @@ class MCDropout(layers.Layer):
         self.rate = rate
 
     def call(self, inputs, training=None):
-        # Always apply dropout, regardless of training flag
         return tf.nn.dropout(inputs, rate=self.rate)
 
     def get_config(self):
@@ -43,51 +45,44 @@ def build_model(
     learning_rate: float = 1e-3,
 ) -> keras.Model:
     """
-    Build the Conv1D → LSTM → MC Dropout model.
+    Build the shared Conv1D → LSTM backbone with 4 independent output heads.
+
+    Output layer names: 'out_1d', 'out_5d', 'out_21d', 'out_126d'
+    Each head predicts P(price up) for its horizon.
 
     Args:
         input_shape: (window_size, n_features)
-        conv_filters: Number of Conv1D filters.
-        conv_kernel_size: Kernel size for Conv1D.
-        lstm_units: Number of LSTM hidden units.
-        dropout_rate: Dropout rate (applied with MC Dropout).
-        learning_rate: Adam learning rate.
-
-    Returns:
-        Compiled Keras model.
     """
     inputs = keras.Input(shape=input_shape, name="input")
 
-    # --- Layer 1: 1D Convolution ---
-    # Captures short-term trends / local dependencies in the time series
+    # --- Shared backbone ---
     x = layers.Conv1D(
         filters=conv_filters,
         kernel_size=conv_kernel_size,
-        padding="causal",          # no future leakage
+        padding="causal",
         activation="relu",
         name="conv1d",
     )(inputs)
     x = layers.BatchNormalization(name="bn_conv")(x)
     x = MCDropout(rate=dropout_rate, name="mc_dropout_conv")(x)
 
-    # --- Layer 2: LSTM ---
-    # Captures long-range sequential dependencies
-    x = layers.LSTM(
-        units=lstm_units,
-        return_sequences=False,
-        name="lstm",
-    )(x)
+    x = layers.LSTM(units=lstm_units, return_sequences=False, name="lstm")(x)
     x = layers.BatchNormalization(name="bn_lstm")(x)
     x = MCDropout(rate=dropout_rate, name="mc_dropout_lstm")(x)
 
-    # --- Output: binary classification ---
-    outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
+    # --- One sigmoid head per horizon ---
+    outputs = {
+        f"out_{h}d": layers.Dense(1, activation="sigmoid", name=f"out_{h}d")(x)
+        for h in HORIZONS
+    }
 
-    model = keras.Model(inputs=inputs, outputs=outputs, name="conv_lstm_predictor")
+    model = keras.Model(inputs=inputs, outputs=outputs, name="conv_lstm_multi_horizon")
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="binary_crossentropy",
-        metrics=["accuracy"],
+        loss={f"out_{h}d": "binary_crossentropy" for h in HORIZONS},
+        loss_weights={f"out_{h}d": 1.0 for h in HORIZONS},
+        metrics={f"out_{h}d": ["accuracy"] for h in HORIZONS},
     )
     return model
 
@@ -100,26 +95,38 @@ def mc_predict(
     model: keras.Model,
     X: np.ndarray,
     n_passes: int = 50,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """
-    Run multiple forward passes with dropout active to estimate uncertainty.
+    Run multiple stochastic forward passes (dropout active) for all 4 heads.
 
     Args:
-        model: Trained Keras model with MCDropout layers.
-        X: Input array of shape (n_samples, window_size, n_features).
+        model: Trained multi-output Keras model with MCDropout layers.
+        X: Input array shape (n_samples, window_size, n_features).
         n_passes: Number of stochastic forward passes.
 
     Returns:
-        mean_probs: Mean predicted probability per sample.
-        std_probs: Standard deviation (uncertainty) per sample.
+        Dict mapping each horizon key to (mean_probs, std_probs):
+        {
+          'out_1d':   (mean (n_samples,), std (n_samples,)),
+          'out_5d':   (...),
+          'out_21d':  (...),
+          'out_126d': (...),
+        }
     """
-    preds = np.stack(
-        [model(X, training=True).numpy().squeeze() for _ in range(n_passes)],
-        axis=0,
-    )  # shape: (n_passes, n_samples)
-    mean_probs = preds.mean(axis=0)
-    std_probs = preds.std(axis=0)
-    return mean_probs, std_probs
+    horizon_keys = [f"out_{h}d" for h in HORIZONS]
+    all_passes   = {k: [] for k in horizon_keys}
+
+    for _ in range(n_passes):
+        raw = model(X, training=True)   # dict of tensors, each (n_samples, 1)
+        for k in horizon_keys:
+            all_passes[k].append(raw[k].numpy().squeeze())
+
+    result = {}
+    for k, passes in all_passes.items():
+        stacked     = np.stack(passes, axis=0)   # (n_passes, n_samples)
+        result[k]   = (stacked.mean(axis=0), stacked.std(axis=0))
+
+    return result
 
 
 # ---------------------------------------------------------------------------

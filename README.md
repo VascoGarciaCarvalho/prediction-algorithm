@@ -1,60 +1,38 @@
 # LSTM Stock Predictor
 
-A deep learning pipeline that predicts daily stock price direction using a Conv1D → LSTM → Monte Carlo Dropout architecture, then evaluates the strategy against S&P 500 and a random baseline with a 3-sigma statistical test.
+A deep learning pipeline that predicts stock price direction across multiple time horizons and evaluates whether those predictions can generate a statistically meaningful trading edge.
 
 ---
 
-## Architecture
+## What It Does
 
-```
-OHLCV + Insider Data + News Sentiment
-              ↓
-     Feature Engineering
-   (SMA, EMA, returns, volume,
-    time, insider, VADER NLP)
-              ↓
-   Sliding Windows (20 days)
-    Chronological 80/20 Split
-              ↓
-  ┌─────────────────────────┐
-  │  Conv1D (causal)        │  ← short-term pattern detection
-  │  LSTM                   │  ← sequential dependencies
-  │  Monte Carlo Dropout    │  ← uncertainty estimation
-  │  Dense (sigmoid)        │  ← P(price goes up tomorrow)
-  └─────────────────────────┘
-              ↓
-     Top-3 Daily Strategy
-              ↓
-   vs S&P 500 + Random Baseline
-          (3-sigma test)
-```
+The system downloads historical market data for a set of stocks, engineers a rich set of features from price action and alternative data sources, and trains a neural network to predict whether each stock will be higher after 1 day, 1 week, 1 month, or 6 months.
+
+Once trained, the model drives a simple trading strategy — buying the most confident, sector-diversified picks each day — and measures whether that strategy meaningfully outperforms random chance and the S&P 500.
 
 ---
 
-## Features
+## How It Works
 
-### Technical Indicators
-| Feature | Description |
-|---|---|
-| SMA 10/20/30 | Simple moving averages |
-| EMA 10/20/30 | Exponential moving averages |
-| Price-to-SMA | How far price sits above/below each average |
-| Daily & Log Return | Raw and log-scale price change |
-| Volatility (10-day) | Rolling standard deviation of returns |
-| Volume Ratio | Today's volume vs. 10-day average |
-| H-L Range | Daily high-low spread normalised by close |
-| Day / Week / Month | Calendar seasonality features |
+**Data & Features**
+Price data is downloaded from Yahoo Finance. On top of raw OHLCV data, the pipeline computes technical indicators (moving averages, volatility, volume trends), calendar features, insider transaction activity, and news sentiment scored locally using NLP. No paid API is required.
 
-### Alternative Data (free, no API key)
-| Feature | Source |
-|---|---|
-| Insider Net Shares | `yfinance` insider transactions |
-| Insider Buy Flag | 1 if insiders are net buying |
-| News Sentiment | `yfinance` news + VADER NLP (runs locally) |
-| News Count | Number of articles published that day |
+**Model**
+A Conv1D layer first extracts short-term patterns from the 20-day input window, then an LSTM captures longer sequential dependencies. The model outputs four independent predictions — one per time horizon — each as a probability that the price will be higher by that date.
 
-### Target Variable
-Binary classification: `1` if next day's return > 0, else `0`.
+Monte Carlo Dropout keeps dropout active at inference time, running multiple forward passes to produce both a prediction and an uncertainty estimate for each output. Uncertain signals are penalised in the trading strategy.
+
+**Training**
+Training follows a three-phase sanity-check workflow before committing to real training.
+
+- **Phase 1 — 1 epoch, answer leaked into input.** The correct labels are injected directly as input features. The model is given the answer. If it can't reach near-perfect accuracy in a single epoch, the data pipeline is broken and there's no point going further.
+
+- **Phase 2 — 50 epochs, indirect hint.** The labels are removed but the future closing prices are included instead. The model must infer direction from those prices. This confirms the architecture is capable of learning a meaningful signal before any real training begins.
+
+- **Phase 3 — 200 epochs, clean features only.** No future data of any kind. This is the real training run, learning purely from historical patterns. The model is saved to disk and used for backtesting.
+
+**Backtesting**
+The saved model is applied to the held-out test period. Each day, the strategy selects up to three stocks with the highest risk-adjusted confidence scores, constrained to one pick per market sector. Returns are benchmarked against a buy-and-hold S&P 500 position and 1,000 random stock-picking simulations. A 3-sigma statistical test determines whether any outperformance is meaningful or just noise.
 
 ---
 
@@ -62,9 +40,9 @@ Binary classification: `1` if next day's return > 0, else `0`.
 
 ```
 prediction-algorithm/
-├── main.py               # CLI orchestrator
-├── data_engineering.py   # Feature pipeline, windows, train/test split
-├── model.py              # Conv1D → LSTM → MC Dropout model
+├── main.py               # CLI entry point
+├── data_engineering.py   # Data download, feature engineering, windowing
+├── model.py              # Neural network architecture and inference
 ├── training.py           # 3-phase training workflow
 ├── backtesting.py        # Strategy evaluation and statistical testing
 └── requirements.txt      # Dependencies
@@ -75,123 +53,27 @@ prediction-algorithm/
 ## Installation
 
 ```bash
-cd prediction-algorithm
 pip3 install -r requirements.txt
 ```
 
-**Requirements:** Python 3.9+, no API keys needed.
+Python 3.9+ required. No API keys needed.
 
 ---
 
 ## Usage
 
-### Full pipeline
 ```bash
+# Run the full pipeline end-to-end
 python3 main.py --all
-```
-Runs Phase 1 → Phase 2 → Phase 3 → Backtest in sequence.
 
-### Step by step
-```bash
-# Phase 1: sanity check (1 epoch, target leaked into features)
+# Or run individual steps
 python3 main.py --phase 1
-
-# Phase 2: indirect check (50 epochs, next-day close in features)
 python3 main.py --phase 2
-
-# Phase 3: real training (200 epochs, saves model_phase3.keras)
 python3 main.py --phase 3
+python3 main.py --backtest --model model_phase3_multihorizon.keras
 
-# Backtest a saved model
-python3 main.py --backtest --model model_phase3.keras
+# Customise tickers and date range
+python3 main.py --all --tickers AAPL MSFT NVDA --start 2018-01-01 --end 2024-01-01
 ```
 
-### Custom tickers and dates
-```bash
-python3 main.py --all \
-  --tickers AAPL MSFT NVDA TSLA AMZN \
-  --start 2018-01-01 \
-  --end 2024-01-01 \
-  --threshold 0.7 \
-  --sims 1000
-```
-
-### All flags
-| Flag | Default | Description |
-|---|---|---|
-| `--all` | — | Run full pipeline |
-| `--phase [1\|2\|3]` | — | Run a single phase |
-| `--backtest` | — | Run backtest only |
-| `--tickers` | 15 large-caps | Space-separated ticker list |
-| `--start` | `2015-01-01` | Training start date |
-| `--end` | `2024-01-01` | Training end date |
-| `--window` | `20` | Sliding window size (days) |
-| `--threshold` | `0.7` | Minimum probability to trigger a buy signal |
-| `--sims` | `1000` | Random baseline simulations |
-| `--model` | `model_phase3.keras` | Path to save/load model |
-| `--no-plot` | — | Skip chart output |
-
----
-
-## 3-Phase Training Workflow
-
-The training follows a deliberate sanity-check sequence before running real training. Each phase must pass before trusting the next.
-
-### Phase 1 — Direct target leak (1 epoch)
-The binary target (`1`/`0`) is injected into the input features. The model is given the answer. Expected accuracy: ~100%. If it fails here, the data pipeline itself is broken.
-
-### Phase 2 — Indirect target leak (50 epochs)
-The target is removed but tomorrow's closing price is included. The model must compute the direction from that price. Expected accuracy: high. If it fails here, the model architecture is too weak to learn.
-
-### Phase 3 — Real training (200 epochs)
-No future data. No shortcuts. No early stopping. The model learns from legitimate historical patterns only. The saved model is used for backtesting.
-
----
-
-## Backtesting & Evaluation
-
-### Top-3 Strategy
-Each trading day, buy equal-weight positions in the 3 stocks with the highest predicted `P(up)`. Sell the next day. Repeat.
-
-### Baselines
-- **S&P 500**: Buy SPY on the first test day, hold to the end.
-- **Random**: Pick 3 random stocks every day, 1,000 times. Creates a distribution of results achievable by chance.
-
-### 3-Sigma Test
-The strategy's total return is compared against the random distribution:
-
-```
-Z = (strategy_return - random_mean) / random_std
-```
-
-| Z-score | Interpretation |
-|---|---|
-| < 1σ | Likely random noise |
-| 1–2σ | Weak signal |
-| 2–3σ | Promising, needs more validation |
-| ≥ 3σ | Statistically significant edge |
-
-### Output
-After backtesting, `backtest_results.png` is saved with two charts:
-- **Cumulative returns** — Top-3 strategy vs S&P 500 vs the grey cloud of random simulations
-- **Return distribution** — Histogram of random outcomes with the strategy's result and 3σ threshold marked
-
----
-
-## Monte Carlo Dropout
-
-Standard dropout is disabled at inference time. Here it stays **always on**. Running 50 forward passes on the same input produces a distribution of predictions:
-
-- **Mean** → the probability forecast used for trading decisions
-- **Std** → the model's uncertainty about that forecast
-
-High uncertainty signals can be filtered out to improve precision at the cost of fewer trades.
-
----
-
-## Notes
-
-- **News sentiment** via `yfinance` only returns recent articles (~20 per ticker), so `News_Sentiment` will be 0 for most historical training rows. It is most useful for live/recent inference.
-- **Insider data** depth varies by ticker and yfinance's available history.
-- **No lookahead bias**: the train/test split is strictly chronological. The scaler is fit only on training data and applied to test data.
-- **CPU training** on 15 tickers from 2015–2024 takes roughly 15–30 minutes for Phase 3. Reduce tickers or shorten the date range to iterate faster.
+Run `python3 main.py --help` for all available flags.

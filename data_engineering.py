@@ -5,6 +5,8 @@ Handles feature engineering, alternative data, preprocessing, and data splitting
 Alternative data sources (all free, no API key required):
   - Insider transactions: yfinance Ticker.insider_transactions
   - News sentiment:       yfinance Ticker.news + VADER (vaderSentiment, local NLP)
+
+Time horizons: 1d, 5d, 21d, 126d (1 day, 1 week, 1 month, 6 months in trading days)
 """
 
 import numpy as np
@@ -16,6 +18,13 @@ import warnings
 warnings.filterwarnings("ignore")
 
 _vader = SentimentIntensityAnalyzer()
+
+# Holding horizons in trading days — imported by model.py and backtesting.py
+HORIZONS = [1, 5, 21, 126]
+
+TARGET_COLS     = [f"Target_{h}d"        for h in HORIZONS]
+NEXT_CLOSE_COLS = [f"Next_Close_{h}d"    for h in HORIZONS]
+RETURN_COLS     = [f"Future_Return_{h}d" for h in HORIZONS]
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +60,6 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA_10"] = close.ewm(span=10, adjust=False).mean()
     df["EMA_20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA_30"] = close.ewm(span=30, adjust=False).mean()
-    # Price relative to moving averages (normalised signals)
     df["Price_to_SMA10"] = close / df["SMA_10"] - 1
     df["Price_to_SMA20"] = close / df["SMA_20"] - 1
     df["Price_to_SMA30"] = close / df["SMA_30"] - 1
@@ -61,22 +69,21 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add calendar / time-based features."""
     df["Day_of_Month"] = df.index.day
-    df["Day_of_Week"] = df.index.dayofweek
-    df["Month"] = df.index.month
+    df["Day_of_Week"]  = df.index.dayofweek
+    df["Month"]        = df.index.month
     return df
 
 
 def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add return, volatility, and volume features."""
     close = df["Close"]
-    df["Daily_Return"] = close.pct_change()
-    df["Log_Return"] = np.log(close / close.shift(1))
+    df["Daily_Return"]  = close.pct_change()
+    df["Log_Return"]    = np.log(close / close.shift(1))
     df["Volatility_10"] = df["Daily_Return"].rolling(10).std()
     df["Volume_Change"] = df["Volume"].pct_change()
-    df["Volume_MA10"] = df["Volume"].rolling(10).mean()
-    df["Volume_Ratio"] = df["Volume"] / df["Volume_MA10"]
-    # High-Low range
-    df["HL_Range"] = (df["High"] - df["Low"]) / close
+    df["Volume_MA10"]   = df["Volume"].rolling(10).mean()
+    df["Volume_Ratio"]  = df["Volume"] / df["Volume_MA10"]
+    df["HL_Range"]      = (df["High"] - df["Low"]) / close
     return df
 
 
@@ -87,37 +94,29 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_insider_data(ticker: str) -> pd.DataFrame:
     """
     Fetch insider transaction data via yfinance (free, no API key).
-
-    yfinance returns a DataFrame with columns including 'Shares', 'Transaction',
-    and a date index. We aggregate net shares per day and flag net-buying days.
+    Returns daily Insider_Net_Shares and Insider_Buy_Flag.
     """
     try:
-        tkr = yf.Ticker(ticker)
-        raw = tkr.insider_transactions
+        raw = yf.Ticker(ticker).insider_transactions
         if raw is None or raw.empty:
             return pd.DataFrame()
 
         raw = raw.copy()
-        # Normalise the date index
         if not isinstance(raw.index, pd.DatetimeIndex):
-            # Older yfinance versions store date in a column called 'Start Date' or 'Date'
             date_col = next(
-                (c for c in raw.columns if "date" in c.lower() or "start" in c.lower()),
-                None,
+                (c for c in raw.columns if "date" in c.lower() or "start" in c.lower()), None
             )
             if date_col is None:
                 return pd.DataFrame()
             raw.index = pd.to_datetime(raw[date_col])
 
         raw.index = pd.to_datetime(raw.index).normalize()
-
-        # Net shares: positive values = purchase, negative = sale
         shares_col = next((c for c in raw.columns if "shares" in c.lower()), None)
         if shares_col is None:
             return pd.DataFrame()
 
         raw[shares_col] = pd.to_numeric(raw[shares_col], errors="coerce").fillna(0)
-        daily = raw.groupby(raw.index)[shares_col].sum().rename("Insider_Net_Shares")
+        daily    = raw.groupby(raw.index)[shares_col].sum().rename("Insider_Net_Shares")
         buy_flag = (daily > 0).astype(int).rename("Insider_Buy_Flag")
         return pd.concat([daily, buy_flag], axis=1)
 
@@ -128,26 +127,21 @@ def fetch_insider_data(ticker: str) -> pd.DataFrame:
 
 def fetch_news_sentiment(ticker: str) -> pd.DataFrame:
     """
-    Fetch recent news via yfinance and score each headline with VADER (local NLP).
-
-    yfinance returns up to ~20 recent news items per ticker.
-    VADER compound score: +1 = most positive, -1 = most negative.
-    Returns daily: News_Sentiment (mean compound), News_Count (article count).
+    Fetch recent news via yfinance and score headlines with VADER (local NLP, no API key).
+    Returns daily News_Sentiment (mean compound) and News_Count.
     """
     try:
-        tkr = yf.Ticker(ticker)
-        news = tkr.news
+        news = yf.Ticker(ticker).news
         if not news:
             return pd.DataFrame()
 
         rows = []
         for item in news:
-            # yfinance news dict keys vary by version; handle both
             publish_ts = item.get("providerPublishTime") or item.get("publishTime")
-            title = item.get("title") or item.get("headline", "")
+            title      = item.get("title") or item.get("headline", "")
             if publish_ts is None or not title:
                 continue
-            date = pd.Timestamp(publish_ts, unit="s").normalize()
+            date  = pd.Timestamp(publish_ts, unit="s").normalize()
             score = _vader.polarity_scores(title)["compound"]
             rows.append({"date": date, "sentiment": score})
 
@@ -156,7 +150,7 @@ def fetch_news_sentiment(ticker: str) -> pd.DataFrame:
 
         df = pd.DataFrame(rows).set_index("date")
         daily_sentiment = df.groupby(df.index)["sentiment"].mean().rename("News_Sentiment")
-        daily_count = df.groupby(df.index)["sentiment"].count().rename("News_Count")
+        daily_count     = df.groupby(df.index)["sentiment"].count().rename("News_Count")
         return pd.concat([daily_sentiment, daily_count], axis=1)
 
     except Exception as e:
@@ -164,41 +158,49 @@ def fetch_news_sentiment(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def add_alternative_data(df: pd.DataFrame, ticker: str, start: str, end: str) -> pd.DataFrame:
+def add_alternative_data(df: pd.DataFrame, ticker: str, start: str = "", end: str = "") -> pd.DataFrame:
     """Merge insider and news sentiment into the main DataFrame, filling gaps with 0."""
     insider = fetch_insider_data(ticker)
     if not insider.empty:
         df = df.join(insider, how="left")
     else:
         df["Insider_Net_Shares"] = 0.0
-        df["Insider_Buy_Flag"] = 0
+        df["Insider_Buy_Flag"]   = 0
 
     news = fetch_news_sentiment(ticker)
     if not news.empty:
         df = df.join(news, how="left")
     else:
         df["News_Sentiment"] = 0.0
-        df["News_Count"] = 0
+        df["News_Count"]     = 0
 
     df["Insider_Net_Shares"] = df["Insider_Net_Shares"].fillna(0)
-    df["Insider_Buy_Flag"] = df["Insider_Buy_Flag"].fillna(0)
-    df["News_Sentiment"] = df["News_Sentiment"].fillna(0)
-    df["News_Count"] = df["News_Count"].fillna(0)
+    df["Insider_Buy_Flag"]   = df["Insider_Buy_Flag"].fillna(0)
+    df["News_Sentiment"]     = df["News_Sentiment"].fillna(0)
+    df["News_Count"]         = df["News_Count"].fillna(0)
     return df
 
 
 # ---------------------------------------------------------------------------
-# 4. Target Variable
+# 4. Target Variables (all four horizons)
 # ---------------------------------------------------------------------------
 
 def add_target(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Binary target: 1 if next day's return > 0, else 0.
-    Also stores the next-day close (for Phase 2 indirect check).
+    Compute binary up/down targets, raw future returns, and next-close values
+    for all four horizons.
+
+    For horizon h (trading days):
+      Future_Return_{h}d = (Close.shift(-h) / Close) - 1   raw h-day return
+      Target_{h}d        = 1 if Future_Return > 0 else 0
+      Next_Close_{h}d    = Close.shift(-h)                  used in Phase 2 only
     """
-    df["Next_Return"] = df["Close"].pct_change().shift(-1)
-    df["Target"] = (df["Next_Return"] > 0).astype(int)
-    df["Next_Close"] = df["Close"].shift(-1)  # used only in Phase 2
+    close = df["Close"]
+    for h in HORIZONS:
+        label = f"{h}d"
+        df[f"Future_Return_{label}"] = close.shift(-h) / close - 1
+        df[f"Target_{label}"]        = (df[f"Future_Return_{label}"] > 0).astype(int)
+        df[f"Next_Close_{label}"]    = close.shift(-h)
     return df
 
 
@@ -228,7 +230,7 @@ def build_features(df: pd.DataFrame, ticker: str, start: str = "", end: str = ""
     df = add_alternative_data(df, ticker, start, end)
     df = add_target(df)
     df = df.dropna(subset=FEATURE_COLS)
-    df = df.dropna(subset=["Target"])
+    df = df.dropna(subset=TARGET_COLS)   # removes last 126 rows (worst-case horizon)
     return df
 
 
@@ -242,40 +244,46 @@ def make_windows(
     window_size: int = 20,
     include_target_in_features: bool = False,
     include_next_close: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """
-    Build (X, y) sliding window arrays.
+    Build sliding window arrays for all four horizons.
 
     Args:
-        df: Feature DataFrame with 'Target' and 'Next_Close' columns.
-        feature_cols: Base feature columns to include.
+        df: Feature DataFrame with Target_{h}d and Next_Close_{h}d columns.
+        feature_cols: Base feature columns (never includes targets for Phase 3).
         window_size: Number of past days per sample.
-        include_target_in_features: Phase 1 sanity check — leak target into X.
-        include_next_close: Phase 2 sanity check — include next day's close in X.
+        include_target_in_features: Phase 1 — leak all 4 Target columns into X.
+        include_next_close: Phase 2 — leak all 4 Next_Close columns into X.
 
     Returns:
         X: shape (n_samples, window_size, n_features)
-        y: shape (n_samples,)
+        y: dict {'out_1d': ..., 'out_5d': ..., 'out_21d': ..., 'out_126d': ...}
+           each value shape (n_samples,)
     """
     cols = list(feature_cols)
     if include_target_in_features:
-        cols = cols + ["Target"]
+        cols = cols + TARGET_COLS
     if include_next_close:
-        cols = cols + ["Next_Close"]
+        cols = cols + NEXT_CLOSE_COLS
 
-    data = df[cols].values
-    targets = df["Target"].values
+    data    = df[cols].values
+    targets = {f"out_{h}d": df[f"Target_{h}d"].values for h in HORIZONS}
 
-    X, y = [], []
+    X_list  = []
+    y_lists = {k: [] for k in targets}
+
     for i in range(window_size, len(data)):
         if include_target_in_features or include_next_close:
-            # Shift window to include row i so the leaked column is visible to the model
-            X.append(data[i - window_size + 1 : i + 1])
+            # Shift window forward to include current row (so leaked column is visible)
+            X_list.append(data[i - window_size + 1 : i + 1])
         else:
-            X.append(data[i - window_size : i])
-        y.append(targets[i])
+            X_list.append(data[i - window_size : i])
+        for k, arr in targets.items():
+            y_lists[k].append(arr[i])
 
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+    X = np.array(X_list, dtype=np.float32)
+    y = {k: np.array(v, dtype=np.float32) for k, v in y_lists.items()}
+    return X, y
 
 
 # ---------------------------------------------------------------------------
@@ -284,12 +292,16 @@ def make_windows(
 
 def chronological_split(
     X: np.ndarray,
-    y: np.ndarray,
+    y: dict[str, np.ndarray],
     train_ratio: float = 0.8,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split arrays chronologically (no shuffling)."""
-    split = int(len(X) * train_ratio)
-    return X[:split], X[split:], y[:split], y[split:]
+) -> tuple[np.ndarray, np.ndarray, dict, dict]:
+    """Split arrays chronologically (no shuffling). y is a dict of arrays."""
+    split  = int(len(X) * train_ratio)
+    X_tr   = X[:split]
+    X_te   = X[split:]
+    y_tr   = {k: v[:split] for k, v in y.items()}
+    y_te   = {k: v[split:] for k, v in y.items()}
+    return X_tr, X_te, y_tr, y_te
 
 
 # ---------------------------------------------------------------------------
@@ -309,14 +321,22 @@ def build_dataset(
     and return a consolidated train/test split.
 
     phase:
-        1 — include Target in features (direct leak check)
-        2 — include Next_Close in features (indirect check)
+        1 — include all 4 Target columns in features (direct leak check)
+        2 — include all 4 Next_Close columns in features (indirect check)
         3 — clean features only (real training)
 
-    Returns a dict with keys: X_train, X_test, y_train, y_test, scalers, dates_test, tickers_test
+    Returns dict with keys:
+        X_train, X_test          : np.ndarray
+        y_train, y_test          : dict[str, np.ndarray]  (4 horizon outputs)
+        future_returns_test      : dict[str, np.ndarray]  (4 raw return arrays)
+        scalers                  : dict[str, StandardScaler]
+        dates_test               : list
+        tickers_test             : list
     """
-    all_X_train, all_y_train = [], []
-    all_X_test, all_y_test = [], []
+    all_X_train, all_X_test = [], []
+    all_y_train = {f"out_{h}d": [] for h in HORIZONS}
+    all_y_test  = {f"out_{h}d": [] for h in HORIZONS}
+    all_fr_test = {f"Future_Return_{h}d": [] for h in HORIZONS}
     all_dates_test, all_tickers_test = [], []
     scalers: dict[str, StandardScaler] = {}
 
@@ -325,43 +345,52 @@ def build_dataset(
     for ticker, raw_df in raw_data.items():
         try:
             df = build_features(raw_df, ticker, start, end)
-            if len(df) < window_size + 10:
+            # Need enough rows after the 126-day horizon drops the tail
+            if len(df) < window_size + 126 + 10:
                 continue
-
-            include_target = (phase == 1)
-            include_next_close = (phase == 2)
 
             X, y = make_windows(
                 df,
                 FEATURE_COLS,
                 window_size=window_size,
-                include_target_in_features=include_target,
-                include_next_close=include_next_close,
+                include_target_in_features=(phase == 1),
+                include_next_close=(phase == 2),
             )
 
-            X_tr, X_te, y_tr, y_te = chronological_split(X, y, train_ratio)
+            n = len(X)
 
-            # Fit scaler on training data, apply to both splits
-            n_features = X_tr.shape[2]
-            scaler = StandardScaler()
-            X_tr_flat = X_tr.reshape(-1, n_features)
+            # Future returns aligned to window indices (row i → target date i)
+            future_returns = {
+                f"Future_Return_{h}d": df[f"Future_Return_{h}d"].values[window_size : window_size + n]
+                for h in HORIZONS
+            }
+
+            X_tr, X_te, y_tr, y_te = chronological_split(X, y, train_ratio)
+            split = int(n * train_ratio)
+            fr_te = {k: v[split:] for k, v in future_returns.items()}
+
+            # Scale features — only X, never targets
+            n_features  = X_tr.shape[2]
+            scaler      = StandardScaler()
+            X_tr_flat   = X_tr.reshape(-1, n_features)
             scaler.fit(X_tr_flat)
             X_tr = scaler.transform(X_tr_flat).reshape(X_tr.shape)
             X_te = scaler.transform(X_te.reshape(-1, n_features)).reshape(X_te.shape)
             scalers[ticker] = scaler
 
-            # Dates corresponding to test windows (the target date, i.e. row after window)
-            test_start_idx = int(len(df) * train_ratio) + window_size
-            # Safe slice — align with actual y_te length
-            ticker_dates = df.index[window_size:][int(len(df[window_size:]) * train_ratio):]
-            ticker_dates = ticker_dates[: len(y_te)]
+            # Dates for test windows
+            ticker_dates = df.index[window_size : window_size + n][split:]
+            ticker_dates = ticker_dates[: len(y_te["out_1d"])]
 
             all_X_train.append(X_tr)
-            all_y_train.append(y_tr)
             all_X_test.append(X_te)
-            all_y_test.append(y_te)
+            for k in all_y_train:
+                all_y_train[k].append(y_tr[k])
+                all_y_test[k].append(y_te[k])
+            for k in all_fr_test:
+                all_fr_test[k].append(fr_te[k])
             all_dates_test.extend(ticker_dates)
-            all_tickers_test.extend([ticker] * len(y_te))
+            all_tickers_test.extend([ticker] * len(y_te["out_1d"]))
 
         except Exception as e:
             print(f"[WARN] Skipping {ticker}: {e}")
@@ -371,11 +400,12 @@ def build_dataset(
         raise RuntimeError("No usable tickers after feature engineering.")
 
     return {
-        "X_train": np.concatenate(all_X_train, axis=0),
-        "y_train": np.concatenate(all_y_train, axis=0),
-        "X_test": np.concatenate(all_X_test, axis=0),
-        "y_test": np.concatenate(all_y_test, axis=0),
-        "scalers": scalers,
-        "dates_test": all_dates_test,
-        "tickers_test": all_tickers_test,
+        "X_train":            np.concatenate(all_X_train, axis=0),
+        "X_test":             np.concatenate(all_X_test,  axis=0),
+        "y_train":            {k: np.concatenate(v) for k, v in all_y_train.items()},
+        "y_test":             {k: np.concatenate(v) for k, v in all_y_test.items()},
+        "future_returns_test": {k: np.concatenate(v) for k, v in all_fr_test.items()},
+        "scalers":            scalers,
+        "dates_test":         all_dates_test,
+        "tickers_test":       all_tickers_test,
     }
