@@ -81,7 +81,12 @@ def build_model(
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
         loss={f"out_{h}d": "binary_crossentropy" for h in HORIZONS},
-        loss_weights={f"out_{h}d": 1.0 for h in HORIZONS},
+        loss_weights={
+            "out_1d":   1.00,   # ~252 independent samples/year
+            "out_5d":   1.00,   # ~50 independent samples/year
+            "out_21d":  0.50,   # ~12 independent samples/year
+            "out_126d": 0.25,   # ~2 independent samples/year
+        },
         metrics={f"out_{h}d": ["accuracy"] for h in HORIZONS},
     )
     return model

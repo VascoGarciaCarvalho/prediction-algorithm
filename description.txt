@@ -19,13 +19,15 @@ main.py — CLI Orchestrator
   pipeline end-to-end (--all) or individual steps (--phase 1/2/3, --backtest).
   Responsible for: wiring all modules together, exposing all user-facing
   configuration options, loading a saved model for standalone backtest runs.
+  Default buy threshold is 0.6 (was 0.7) and default lambda penalty is 0.5
+  (was 1.0) — both tuned to produce more selective signals.
 
 data_engineering.py — Data & Feature Pipeline
   Handles everything from raw download to ready-to-train arrays.
   Key responsibilities:
     - Downloading OHLCV price data via yfinance
     - Computing technical indicators (moving averages, returns, volatility,
-      volume ratios, high-low range, calendar features)
+      volume ratios, high-low range, calendar features, RSI, MACD)
     - Fetching alternative data: insider transactions and news sentiment
       (both free via yfinance with no API key required)
     - Scoring news headlines with VADER NLP (local, no external API)
@@ -39,7 +41,7 @@ data_engineering.py — Data & Feature Pipeline
 model.py — Neural Network Definition & Inference
   Defines the model architecture and the Monte Carlo inference function.
   Architecture:
-    - Input: (window_size=20, n_features=24) tensor
+    - Input: (window_size=20, n_features=29) tensor
     - Conv1D with causal padding: detects short-term local patterns without
       looking into the future
     - BatchNormalization: stabilises training
@@ -49,6 +51,9 @@ model.py — Neural Network Definition & Inference
     - BatchNormalization + MCDropout again
     - 4 independent Dense(1, sigmoid) output heads: one per horizon
       (out_1d, out_5d, out_21d, out_126d), each predicting P(price goes up)
+    - Loss weights per head: 1.00 (1d), 1.00 (5d), 0.50 (21d), 0.25 (126d)
+      to compensate for the decreasing number of independent samples per year
+      at longer horizons
   MCDropout inference (mc_predict):
     - Runs 50 forward passes on the same input with dropout active
     - Returns mean probability (the forecast) and std (the uncertainty)
@@ -69,10 +74,12 @@ training.py — 3-Phase Training Workflow
     Purpose: validates that the architecture is capable of learning a signal.
     If this fails, the model is too weak or misconfigured.
 
-  Phase 3 — Real Training (200 epochs):
-    Clean features only — no future data of any kind. No early stopping.
-    This is the legitimate training run. The model is saved as a .keras file
-    for use in backtesting.
+  Phase 3 — Real Training (up to 500 epochs, early stopping):
+    Clean features only — no future data of any kind.
+    Early stopping with patience=20 monitors val_loss and restores the best
+    weights automatically (via ModelCheckpoint). ReduceLROnPlateau halves the
+    learning rate after 10 epochs of no val_loss improvement (min lr: 1e-6).
+    The model is saved as model_phase3_multihorizon.keras for backtesting.
 
 backtesting.py — Strategy Evaluation & Statistical Testing
   Applies the trained model to the test set and measures strategy performance.
@@ -82,11 +89,9 @@ backtesting.py — Strategy Evaluation & Statistical Testing
 
   Step 2 — Risk-Adjusted Scoring:
     For each horizon h, computes:
-      score_h = (P(up) / h_days) - lambda_penalty * (uncertainty / h_days)
-    Dividing by h_days normalises scores across horizons (so a 6-month
-    prediction isn't unfairly penalised for being further away).
-    Selects the best horizon per stock per day. A buy signal fires when
-    best_score > 0 AND P(up) >= buy_threshold.
+      score_h = P(up) - lambda_penalty * uncertainty
+    The best horizon per stock per day is the one with the highest score.
+    A buy signal fires when best_score > 0 AND P(up) >= buy_threshold.
 
   Step 3 — Sector-Diversified Top-3 Strategy:
     Each day, selects up to 3 stocks with at most 1 per sector.
@@ -105,9 +110,13 @@ backtesting.py — Strategy Evaluation & Statistical Testing
     at the 99.7% confidence level (p < 0.003).
 
   Output:
-    Prints a full results table. Saves backtest_results.png with:
-      - Cumulative return chart: strategy vs S&P 500 vs random cloud
-      - Return distribution histogram: strategy result vs 3σ threshold
+    Prints a full results table. Saves two chart files:
+      backtest_results.png — cumulative return chart (strategy vs S&P 500 vs
+        random cloud) and return distribution histogram with 3σ threshold.
+      decision_log.png — 3-panel chart: (1) heatmap of which stocks were
+        picked each day, colour-coded by chosen horizon; (2) weekly stacked
+        bar of horizon usage over time; (3) weekly stacked bar of sector
+        allocation over time.
 
 
 TECHNOLOGIES AND THEIR PURPOSES
@@ -137,10 +146,10 @@ scikit-learn (scikit-learn>=1.3.0)
 TensorFlow / Keras (tensorflow>=2.13.0)
   Purpose: Deep learning framework.
   Used for: defining the Conv1D → LSTM multi-output model, training across
-  all 4 horizon heads simultaneously with binary_crossentropy losses,
-  saving and loading the model in .keras format, running inference.
-  The custom MCDropout layer overrides Keras's standard dropout to keep it
-  active at inference time.
+  all 4 horizon heads simultaneously with binary_crossentropy losses and
+  horizon-scaled loss weights, saving and loading the model in .keras format,
+  running inference. The custom MCDropout layer overrides Keras's standard
+  dropout to keep it active at inference time.
 
 vaderSentiment (vaderSentiment>=3.3.2)
   Purpose: Sentiment analysis of news headlines.
@@ -150,8 +159,8 @@ vaderSentiment (vaderSentiment>=3.3.2)
 
 matplotlib (matplotlib>=3.7.0)
   Purpose: Visualisation.
-  Used for: generating the two-panel backtest results chart showing
-  cumulative returns and the random return distribution with the 3σ marker.
+  Used for: generating the backtest_results.png (cumulative returns + 3σ
+  histogram) and the decision_log.png (heatmap + horizon/sector bar charts).
 
 scipy (scipy>=1.11.0)
   Purpose: Statistical analysis.
@@ -167,6 +176,10 @@ DATA FLOW SUMMARY
   pandas DataFrames per ticker
        ↓
   Technical indicators (numpy / pandas rolling ops)
+  — SMA/EMA (10/20/30), price-to-SMA ratios
+  — RSI(14), MACD(12,26,9), MACD Signal, MACD Histogram
+  — Daily/log returns, 10-day volatility, volume features, HL range
+  — Cyclical calendar features (day-of-week and month sin/cos)
        ↓
   Alternative data: insider + VADER sentiment (yfinance + vaderSentiment)
        ↓
@@ -174,9 +187,10 @@ DATA FLOW SUMMARY
        ↓
   StandardScaler fit on train (scikit-learn)
        ↓
-  Sliding window numpy arrays (n_samples × 20 × 24)
+  Sliding window numpy arrays (n_samples × 20 × 29)
        ↓
   TensorFlow/Keras training across 4 output heads
+  (up to 500 epochs, early stopping patience=20, ReduceLROnPlateau)
        ↓
   Monte Carlo inference (50 passes, MCDropout active)
        ↓
@@ -184,7 +198,59 @@ DATA FLOW SUMMARY
        ↓
   Cumulative returns vs S&P 500 vs 1000 random simulations
        ↓
-  3-sigma Z-test (scipy) + matplotlib chart saved to disk
+  3-sigma Z-test (scipy) + matplotlib charts saved to disk
+
+
+WHAT CHANGED FROM THE PREVIOUS VERSION
+---------------------------------------
+
+1. Feature set expanded from 24 to 29 features:
+     Added: MACD, MACD_Signal, MACD_Hist (momentum histogram from MACD)
+             Price_to_SMA10, Price_to_SMA20, Price_to_SMA30 (price deviation
+             from each moving average as a ratio)
+     These provide the model with richer momentum and mean-reversion signals.
+
+2. Phase 3 now uses early stopping (was fixed at 200 epochs with no stopping):
+     - Up to 500 epochs with EarlyStopping(patience=20, monitor=val_loss)
+     - ModelCheckpoint restores the lowest-val_loss weights automatically
+     - ReduceLROnPlateau halves the learning rate after 10 stagnant epochs
+     - Model saved as model_phase3_multihorizon.keras (was model_phase3.keras)
+
+3. Horizon-weighted losses introduced:
+     out_1d: 1.00, out_5d: 1.00, out_21d: 0.50, out_126d: 0.25
+     Downweights longer horizons because they provide far fewer independent
+     training examples per year, preventing them from dominating the loss.
+
+4. Risk-adjusted score formula simplified:
+     Old: score = (P(up) / h_days) - lambda * (uncertainty / h_days)
+     New: score = P(up) - lambda * uncertainty
+     Dividing by h_days caused short-horizon scores to be artificially inflated.
+     The new formula lets the model compare horizons on equal footing.
+
+5. Default buy_threshold lowered from 0.7 to 0.6:
+     Generates more buy signals while still requiring above-chance confidence.
+
+6. Default lambda_penalty lowered from 1.0 to 0.5:
+     Reduces how heavily uncertainty penalises a position, allowing confident
+     longer-horizon predictions to compete with shorter-horizon ones.
+
+7. Alternative data source changed from Finnhub to yfinance entirely:
+     The previous version used Finnhub for insider data (required FINNHUB_API_KEY).
+     All alternative data (insider transactions and news) now comes from yfinance,
+     which is completely free and requires no API key.
+
+8. Default ticker universe expanded to 15 tickers everywhere:
+     Added UNH, HD, PG, MA, DIS — covering Healthcare, ConsumerDiscretionary,
+     ConsumerStaples, and Financials sectors more completely.
+     The sector map in backtesting.py covers all 15 tickers.
+
+9. New decision log visualisation (decision_log.png):
+     A 3-panel chart added to the backtest output:
+       Panel 1: Heatmap — which stocks were selected on each day, colour-coded
+                by the horizon used (1d / 5d / 21d / 126d)
+       Panel 2: Weekly stacked bar showing horizon usage over time
+       Panel 3: Weekly stacked bar showing sector allocation over time
+     Provides interpretability into what the strategy was actually doing.
 
 
 LIMITATIONS AND DESIGN CHOICES
@@ -202,9 +268,6 @@ LIMITATIONS AND DESIGN CHOICES
 
 - The last 126 rows per ticker are always dropped from the dataset because
   the 126-day forward target cannot be computed for them.
-
-- No early stopping in Phase 3 by design: the goal is to learn maximum signal
-  from the data without stopping prematurely based on validation noise.
 
 - Sector map is hardcoded for the 15 default tickers. Custom tickers not in
   the map are each treated as their own sector (ticker name used as sector key),

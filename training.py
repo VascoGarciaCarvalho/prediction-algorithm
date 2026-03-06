@@ -31,9 +31,25 @@ def _train(
     if use_early_stopping:
         callbacks.append(
             keras.callbacks.EarlyStopping(
-                monitor="val_out_1d_accuracy",
-                patience=10,
+                monitor="val_loss",
+                patience=20,
                 restore_best_weights=True,
+            )
+        )
+        callbacks.append(
+            keras.callbacks.ModelCheckpoint(
+                filepath="model_best_checkpoint.keras",
+                monitor="val_loss",
+                save_best_only=True,
+            )
+        )
+        callbacks.append(
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=10,
+                min_lr=1e-6,
+                verbose=1,
             )
         )
 
@@ -140,16 +156,16 @@ def run_phase3(
     start: str,
     end: str,
     window_size: int = 20,
-    epochs: int = 200,
+    epochs: int = 500,
     batch_size: int = 64,
     save_path: str = "model_phase3_multihorizon.keras",
 ) -> tuple[keras.Model, dict, keras.callbacks.History]:
     """
-    Legitimate training: no future data, no callbacks, 200 epochs.
+    Legitimate training: no future data, early stopping, up to 500 epochs.
     Saves model to disk and returns (model, dataset, history).
     """
     print("\n" + "=" * 60)
-    print("PHASE 3: Real Training (200 epochs, clean features)")
+    print("PHASE 3: Real Training (up to 500 epochs, early stopping, clean features)")
     print("=" * 60)
 
     dataset = build_dataset(tickers, start, end, window_size=window_size, phase=3)
@@ -163,7 +179,7 @@ def run_phase3(
     history = _train(
         model, X_train, y_train, X_test, y_test,
         epochs=epochs, batch_size=batch_size,
-        use_early_stopping=False,
+        use_early_stopping=True,
     )
 
     _evaluate(model, X_test, y_test, phase=3)

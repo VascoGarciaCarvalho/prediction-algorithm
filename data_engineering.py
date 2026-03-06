@@ -67,10 +67,13 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add calendar / time-based features."""
-    df["Day_of_Month"] = df.index.day
-    df["Day_of_Week"]  = df.index.dayofweek
-    df["Month"]        = df.index.month
+    """Add cyclically-encoded calendar features (sin/cos) to preserve circular topology."""
+    dow   = df.index.dayofweek   # 0=Mon … 4=Fri
+    month = df.index.month       # 1=Jan … 12=Dec
+    df["DoW_sin"]   = np.sin(2 * np.pi * dow   / 5)
+    df["DoW_cos"]   = np.cos(2 * np.pi * dow   / 5)
+    df["Month_sin"] = np.sin(2 * np.pi * (month - 1) / 12)
+    df["Month_cos"] = np.cos(2 * np.pi * (month - 1) / 12)
     return df
 
 
@@ -84,6 +87,35 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
     df["Volume_MA10"]   = df["Volume"].rolling(10).mean()
     df["Volume_Ratio"]  = df["Volume"] / df["Volume_MA10"]
     df["HL_Range"]      = (df["High"] - df["Low"]) / close
+    return df
+
+
+def add_momentum_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add RSI(14) and MACD(12, 26, 9) momentum indicators."""
+    close = df["Close"]
+    # RSI(14) — Wilder smoothing via ewm(com=13)
+    delta    = close.diff()
+    avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    rs            = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI_14"]  = (100 - (100 / (1 + rs))).fillna(50)  # 50 = neutral fill
+    # MACD(12, 26, 9)
+    ema12              = close.ewm(span=12, adjust=False).mean()
+    ema26              = close.ewm(span=26, adjust=False).mean()
+    df["MACD"]         = ema12 - ema26
+    df["MACD_Signal"]  = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_Hist"]    = df["MACD"] - df["MACD_Signal"]
+    return df
+
+
+def add_market_context(
+    df: pd.DataFrame,
+    spy_returns: pd.Series,
+    vix_levels: pd.Series,
+) -> pd.DataFrame:
+    """Merge market-wide SPY daily return and VIX closing level into the ticker DataFrame."""
+    df["SPY_Return"] = spy_returns.reindex(df.index).ffill().fillna(0)
+    df["VIX_Level"]  = vix_levels.reindex(df.index).ffill().fillna(20)  # 20 = historical median
     return df
 
 
@@ -215,18 +247,30 @@ FEATURE_COLS = [
     "Price_to_SMA10", "Price_to_SMA20", "Price_to_SMA30",
     "Daily_Return", "Log_Return", "Volatility_10",
     "Volume_Change", "Volume_Ratio", "HL_Range",
-    "Day_of_Month", "Day_of_Week", "Month",
+    "DoW_sin", "DoW_cos", "Month_sin", "Month_cos",
+    "SPY_Return", "VIX_Level",
+    "RSI_14", "MACD", "MACD_Signal", "MACD_Hist",
     "Insider_Net_Shares", "Insider_Buy_Flag",
     "News_Sentiment", "News_Count",
 ]
 
 
-def build_features(df: pd.DataFrame, ticker: str, start: str = "", end: str = "") -> pd.DataFrame:
+def build_features(
+    df: pd.DataFrame,
+    ticker: str,
+    start: str = "",
+    end: str = "",
+    spy_returns: pd.Series | None = None,
+    vix_levels: pd.Series | None = None,
+) -> pd.DataFrame:
     """Apply the full feature engineering pipeline to a single ticker DataFrame."""
     df = df.copy()
     df = add_moving_averages(df)
     df = add_time_features(df)
     df = add_price_features(df)
+    df = add_momentum_indicators(df)
+    if spy_returns is not None and vix_levels is not None:
+        df = add_market_context(df, spy_returns, vix_levels)
     df = add_alternative_data(df, ticker, start, end)
     df = add_target(df)
     df = df.dropna(subset=FEATURE_COLS)
@@ -294,13 +338,19 @@ def chronological_split(
     X: np.ndarray,
     y: dict[str, np.ndarray],
     train_ratio: float = 0.8,
+    purge_horizon: int = 126,
 ) -> tuple[np.ndarray, np.ndarray, dict, dict]:
-    """Split arrays chronologically (no shuffling). y is a dict of arrays."""
-    split  = int(len(X) * train_ratio)
-    X_tr   = X[:split]
-    X_te   = X[split:]
-    y_tr   = {k: v[:split] for k, v in y.items()}
-    y_te   = {k: v[split:] for k, v in y.items()}
+    """
+    Split arrays chronologically. Purges the last `purge_horizon` training samples
+    to prevent label leakage: targets for those samples reference prices in the test period.
+    The test set is unaffected.
+    """
+    split     = int(len(X) * train_ratio)
+    purge_cut = max(0, split - purge_horizon)
+    X_tr  = X[:purge_cut]
+    X_te  = X[split:]
+    y_tr  = {k: v[:purge_cut] for k, v in y.items()}
+    y_te  = {k: v[split:]     for k, v in y.items()}
     return X_tr, X_te, y_tr, y_te
 
 
@@ -342,9 +392,18 @@ def build_dataset(
 
     raw_data = download_market_data(tickers, start, end)
 
+    _spy = yf.download("SPY",  start=start, end=end, auto_adjust=True, progress=False)
+    _vix = yf.download("^VIX", start=start, end=end, auto_adjust=True, progress=False)
+    if isinstance(_spy.columns, pd.MultiIndex):
+        _spy.columns = _spy.columns.get_level_values(0)
+    if isinstance(_vix.columns, pd.MultiIndex):
+        _vix.columns = _vix.columns.get_level_values(0)
+    spy_returns = _spy["Close"].pct_change().rename("SPY_Return")
+    vix_levels  = _vix["Close"].rename("VIX_Level")
+
     for ticker, raw_df in raw_data.items():
         try:
-            df = build_features(raw_df, ticker, start, end)
+            df = build_features(raw_df, ticker, start, end, spy_returns=spy_returns, vix_levels=vix_levels)
             # Need enough rows after the 126-day horizon drops the tail
             if len(df) < window_size + 126 + 10:
                 continue

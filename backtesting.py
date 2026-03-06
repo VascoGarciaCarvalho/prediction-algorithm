@@ -86,7 +86,7 @@ def generate_predictions(
 
     for key, h in HORIZON_DAYS.items():
         mean_p, std_p = mc_results[key]
-        score  = (mean_p / h) - lambda_penalty * (std_p / h)
+        score  = mean_p - lambda_penalty * std_p
         label  = key.replace("out_", "")          # e.g. '1d'
         rows[f"prob_up_{label}"]     = mean_p
         rows[f"uncertainty_{label}"] = std_p

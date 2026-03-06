@@ -44,10 +44,10 @@ def parse_args():
     parser.add_argument("--start",   default=DEFAULT_START)
     parser.add_argument("--end",     default=DEFAULT_END)
     parser.add_argument("--window",  type=int,   default=DEFAULT_WINDOW)
-    parser.add_argument("--threshold",      type=float, default=0.7,
-                        help="Minimum P(up) to trigger a buy signal (default 0.7)")
-    parser.add_argument("--lambda-penalty", type=float, default=1.0,
-                        help="Uncertainty penalty weight in risk-adjusted score (default 1.0)")
+    parser.add_argument("--threshold",      type=float, default=0.6,
+                        help="Minimum P(up) to trigger a buy signal (default 0.6)")
+    parser.add_argument("--lambda-penalty", type=float, default=0.5,
+                        help="Uncertainty penalty weight in risk-adjusted score (default 0.5)")
     parser.add_argument("--sims",    type=int,   default=1000,
                         help="Number of random baseline simulations")
     parser.add_argument("--model",   default=DEFAULT_MODEL_PATH,
@@ -89,7 +89,7 @@ def main():
         run_phase2(**kwargs, epochs=50)
 
         print("\n>>> Running Phase 3 (real training)...")
-        model, dataset, _ = run_phase3(**kwargs, epochs=200, save_path=args.model)
+        model, dataset, _ = run_phase3(**kwargs, epochs=500, save_path=args.model)
 
         print("\n>>> Running backtest...")
         run_backtest(model=model, dataset=dataset, **backtest_kwargs)
@@ -101,7 +101,7 @@ def main():
         run_phase2(**kwargs, epochs=50)
 
     elif args.phase == 3:
-        run_phase3(**kwargs, epochs=200, save_path=args.model)
+        run_phase3(**kwargs, epochs=500, save_path=args.model)
 
     elif args.backtest:
         if not os.path.exists(args.model):
