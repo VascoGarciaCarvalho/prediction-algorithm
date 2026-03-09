@@ -6,7 +6,7 @@ Alternative data sources (all free, no API key required):
   - Insider transactions: yfinance Ticker.insider_transactions
   - News sentiment:       yfinance Ticker.news + VADER (vaderSentiment, local NLP)
 
-Time horizons: 1d, 5d, 21d, 126d (1 day, 1 week, 1 month, 6 months in trading days)
+Time horizons: 1d, 5d, 21d (1 day, 1 week, 1 month in trading days)
 """
 
 import numpy as np
@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 _vader = SentimentIntensityAnalyzer()
 
 # Holding horizons in trading days — imported by model.py and backtesting.py
-HORIZONS = [1, 5, 21, 126]
+HORIZONS = [1, 5, 21]
 
 TARGET_COLS     = [f"Target_{h}d"        for h in HORIZONS]
 NEXT_CLOSE_COLS = [f"Next_Close_{h}d"    for h in HORIZONS]
@@ -105,6 +105,31 @@ def add_momentum_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["MACD"]         = ema12 - ema26
     df["MACD_Signal"]  = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_Hist"]    = df["MACD"] - df["MACD_Signal"]
+    return df
+
+
+def add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Bollinger Bands (20,2) and ATR(14)."""
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+
+    # Bollinger Bands (20, 2σ)
+    bb_mid          = close.rolling(20).mean()
+    bb_std          = close.rolling(20).std()
+    df["BB_Upper"]  = bb_mid + 2 * bb_std
+    df["BB_Lower"]  = bb_mid - 2 * bb_std
+    df["BB_Width"]  = (df["BB_Upper"] - df["BB_Lower"]) / bb_mid   # normalised width
+    df["BB_Pct"]    = (close - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"] + 1e-9)
+
+    # ATR(14) — True Range smoothed with Wilder EWM
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR_14"] = tr.ewm(com=13, adjust=False).mean()
+
     return df
 
 
@@ -250,6 +275,7 @@ FEATURE_COLS = [
     "DoW_sin", "DoW_cos", "Month_sin", "Month_cos",
     "SPY_Return", "VIX_Level",
     "RSI_14", "MACD", "MACD_Signal", "MACD_Hist",
+    "BB_Upper", "BB_Lower", "BB_Width", "BB_Pct", "ATR_14",
     "Insider_Net_Shares", "Insider_Buy_Flag",
     "News_Sentiment", "News_Count",
 ]
@@ -260,8 +286,8 @@ def build_features(
     ticker: str,
     start: str = "",
     end: str = "",
-    spy_returns: pd.Series | None = None,
-    vix_levels: pd.Series | None = None,
+    spy_returns: "pd.Series | None" = None,
+    vix_levels: "pd.Series | None" = None,
 ) -> pd.DataFrame:
     """Apply the full feature engineering pipeline to a single ticker DataFrame."""
     df = df.copy()
@@ -269,12 +295,33 @@ def build_features(
     df = add_time_features(df)
     df = add_price_features(df)
     df = add_momentum_indicators(df)
+    df = add_volatility_features(df)
     if spy_returns is not None and vix_levels is not None:
         df = add_market_context(df, spy_returns, vix_levels)
     df = add_alternative_data(df, ticker, start, end)
     df = add_target(df)
     df = df.dropna(subset=FEATURE_COLS)
-    df = df.dropna(subset=TARGET_COLS)   # removes last 126 rows (worst-case horizon)
+    df = df.dropna(subset=TARGET_COLS)   # removes last 21 rows (worst-case horizon)
+    return df
+
+
+def _build_features_for_live(
+    df: pd.DataFrame,
+    ticker: str,
+    spy_returns: "pd.Series | None" = None,
+    vix_levels: "pd.Series | None" = None,
+) -> pd.DataFrame:
+    """Feature engineering without target columns — used for live predictions."""
+    df = df.copy()
+    df = add_moving_averages(df)
+    df = add_time_features(df)
+    df = add_price_features(df)
+    df = add_momentum_indicators(df)
+    df = add_volatility_features(df)
+    if spy_returns is not None and vix_levels is not None:
+        df = add_market_context(df, spy_returns, vix_levels)
+    df = add_alternative_data(df, ticker)
+    df = df.dropna(subset=FEATURE_COLS)
     return df
 
 
@@ -338,7 +385,7 @@ def chronological_split(
     X: np.ndarray,
     y: dict[str, np.ndarray],
     train_ratio: float = 0.8,
-    purge_horizon: int = 126,
+    purge_horizon: int = 21,
 ) -> tuple[np.ndarray, np.ndarray, dict, dict]:
     """
     Split arrays chronologically. Purges the last `purge_horizon` training samples
@@ -468,3 +515,72 @@ def build_dataset(
         "dates_test":         all_dates_test,
         "tickers_test":       all_tickers_test,
     }
+
+
+# ---------------------------------------------------------------------------
+# 9. Live Signal Windows (no targets — for --live mode)
+# ---------------------------------------------------------------------------
+
+def build_live_windows(
+    tickers: list[str],
+    window_size: int = 20,
+    scalers: dict = None,
+    lookback_days: int = 365,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Build live prediction windows from the most recent market data.
+
+    Downloads ~lookback_days of history per ticker to warm up rolling indicators,
+    then extracts the final window of `window_size` rows for prediction.
+
+    Args:
+        tickers:       List of ticker symbols.
+        window_size:   Number of past trading days per sample (must match training).
+        scalers:       Dict of {ticker: StandardScaler} from the training dataset.
+                       When provided, each window is scaled with its training scaler.
+        lookback_days: Days of history to download (default 365; needs >> window_size).
+
+    Returns:
+        X_live:       np.ndarray of shape (n_valid_tickers, window_size, n_features)
+        live_tickers: list of tickers in the same order as X_live rows
+    """
+    from datetime import date, timedelta
+
+    today = date.today().strftime("%Y-%m-%d")
+    start = (date.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    raw_data = download_market_data(tickers, start, today)
+
+    _spy = yf.download("SPY",  start=start, end=today, auto_adjust=True, progress=False)
+    _vix = yf.download("^VIX", start=start, end=today, auto_adjust=True, progress=False)
+    if isinstance(_spy.columns, pd.MultiIndex):
+        _spy.columns = _spy.columns.get_level_values(0)
+    if isinstance(_vix.columns, pd.MultiIndex):
+        _vix.columns = _vix.columns.get_level_values(0)
+    spy_returns = _spy["Close"].pct_change().rename("SPY_Return")
+    vix_levels  = _vix["Close"].rename("VIX_Level")
+
+    X_live       = []
+    live_tickers = []
+
+    for ticker, raw_df in raw_data.items():
+        try:
+            df = _build_features_for_live(raw_df, ticker, spy_returns=spy_returns, vix_levels=vix_levels)
+            if len(df) < window_size:
+                print(f"[WARN] {ticker}: only {len(df)} rows after feature engineering (need {window_size}); skipping.")
+                continue
+
+            window = df[FEATURE_COLS].values[-window_size:].astype(np.float32)
+
+            if scalers and ticker in scalers:
+                window = scalers[ticker].transform(window).astype(np.float32)
+
+            X_live.append(window)
+            live_tickers.append(ticker)
+        except Exception as e:
+            print(f"[WARN] Skipping {ticker} for live prediction: {e}")
+
+    if not X_live:
+        raise RuntimeError("No tickers produced a valid live window.")
+
+    return np.array(X_live, dtype=np.float32), live_tickers

@@ -1,0 +1,10 @@
+{
+  "total_return": 0.45071934863767815,
+  "sp500_total_return": 0.07535050746608518,
+  "sigma_test": {
+    "strategy_return": 0.45071934863767815,
+    "random_mean": 0.13703243810263405,
+    "random_std": 0.2093599066933111,
+    "z_score": 1.4983141494926269,
+    "p_value": 0.06702582477814545,
+    "passes_3sigma": 

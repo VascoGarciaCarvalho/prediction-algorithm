@@ -1,0 +1,34 @@
+# LSTM Stock Predictor — default configuration
+# All values here can be overridden by CLI flags at runtime.
+# Usage: python3 main.py --config config.yaml --backtest
+
+tickers:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - META
+  - NVDA
+  - TSLA
+  - JPM
+  - JNJ
+  - V
+  - UNH
+  - HD
+  - PG
+  - MA
+  - DIS
+
+start: "2015-01-01"
+end: "2024-01-01"
+window: 20
+model: "model_phase3_multihorizon.keras"
+
+# Strategy
+threshold: 0.6         # minimum P(up) for a BUY signal
+lambda_penalty: 0.5    # uncertainty penalty in risk-adjusted score
+sims: 1000             # random Monte Carlo simulations in backtest
+
+# Walk-forward validation
+wf_train_years: 5
+wf_test_months: 6

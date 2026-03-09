@@ -17,7 +17,6 @@ Evaluation: 3-sigma test against random distribution.
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import matplotlib.pyplot as plt
 from scipy import stats
 from tensorflow import keras
 from model import mc_predict
@@ -223,6 +222,7 @@ def compute_top3_returns(
                 "best_horizon": rec.get("best_horizon", "out_1d"),
                 "best_score":   rec.get("best_score", 0.0),
                 "best_prob_up": rec.get("best_prob_up", 0.0),
+                "pick_return":  ret,
             })
 
         daily_returns[date] = np.mean(day_ret) if day_ret else 0.0
@@ -292,6 +292,91 @@ def cumulative_return(daily_returns: pd.Series) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# 6a. Risk / Performance Metrics
+# ---------------------------------------------------------------------------
+
+def compute_risk_metrics(daily_returns: pd.Series) -> dict:
+    """
+    Compute standard risk/performance metrics from a daily returns Series.
+
+    Returns:
+      total_return, annualised_return, sharpe_ratio, max_drawdown,
+      calmar_ratio, win_rate, profit_factor, n_trading_days
+    """
+    dr = daily_returns.dropna()
+    if len(dr) == 0:
+        return {}
+
+    total_return      = float((1 + dr).prod() - 1)
+    n_days            = len(dr)
+    annualised_return = float((1 + total_return) ** (252 / n_days) - 1)
+
+    mean_daily = float(dr.mean())
+    std_daily  = float(dr.std())
+    sharpe     = float((mean_daily / std_daily) * np.sqrt(252)) if std_daily > 0 else 0.0
+
+    cum         = (1 + dr).cumprod()
+    drawdowns   = cum / cum.cummax() - 1
+    max_drawdown = float(drawdowns.min())
+    calmar      = float(annualised_return / abs(max_drawdown)) if max_drawdown < 0 else float("nan")
+
+    win_rate     = float((dr > 0).mean())
+    gains        = dr[dr > 0].sum()
+    losses       = dr[dr < 0].sum()
+    profit_factor = float(gains / abs(losses)) if losses < 0 else float("nan")
+
+    return {
+        "total_return":      total_return,
+        "annualised_return": annualised_return,
+        "sharpe_ratio":      sharpe,
+        "max_drawdown":      max_drawdown,
+        "calmar_ratio":      calmar,
+        "win_rate":          win_rate,
+        "profit_factor":     profit_factor,
+        "n_trading_days":    n_days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6b. Per-Ticker Performance Breakdown
+# ---------------------------------------------------------------------------
+
+def compute_ticker_breakdown(
+    selections_df: pd.DataFrame,
+    price_cache: dict,
+) -> pd.DataFrame:
+    """
+    Compute per-ticker performance stats from the selections log.
+
+    Returns DataFrame: ticker | times_picked | win_rate | mean_return | contribution_pct
+    """
+    if selections_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for ticker, grp in selections_df.groupby("ticker"):
+        returns = []
+        for _, row in grp.iterrows():
+            h_key  = row.get("best_horizon", "out_1d")
+            h_days = HORIZON_DAYS.get(h_key, 1)
+            ret    = _hday_return_for(ticker, row["date"], h_days, price_cache)
+            returns.append(ret)
+        returns = np.array(returns)
+        rows.append({
+            "ticker":       ticker,
+            "times_picked": len(grp),
+            "win_rate":     float((returns > 0).mean()) if len(returns) else 0.0,
+            "mean_return":  float(returns.mean())       if len(returns) else 0.0,
+            "total_contrib": float(returns.sum()),
+        })
+
+    df = pd.DataFrame(rows).sort_values("total_contrib", ascending=False).reset_index(drop=True)
+    total_abs = df["total_contrib"].abs().sum()
+    df["contribution_pct"] = df["total_contrib"] / total_abs * 100 if total_abs > 0 else 0.0
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 7. 3-Sigma Statistical Test
 # ---------------------------------------------------------------------------
 
@@ -334,10 +419,13 @@ def run_backtest(
     n_random_sims: int = 1000,
     mc_passes: int = 50,
     plot: bool = True,
-    save_plot: str = "backtest_results.png",
-    save_decision_log: str = "decision_log.png",
+    export: bool = True,
+    save_plot: str = "backtest_results.html",
+    save_decision_log: str = "decision_log.html",
 ) -> dict:
     """Full backtest pipeline. Returns a results dict with all metrics."""
+    import json
+
     if sector_map is None:
         sector_map = SECTOR_MAP
 
@@ -388,35 +476,97 @@ def run_backtest(
     sigma_result = three_sigma_test(top3_total, random_totals)
     sigma_result["_random_totals"] = random_totals   # stored for plotting
 
+    # Risk metrics
+    risk = compute_risk_metrics(top3_daily)
+    sp500_risk = compute_risk_metrics(sp500_daily)
+
+    # Per-ticker breakdown
+    ticker_breakdown = compute_ticker_breakdown(selections_df, price_cache)
+
     print("\n" + "=" * 60)
     print("BACKTEST RESULTS")
     print("=" * 60)
     print(f"  Strategy (Top-3) Total Return : {top3_total:+.2%}")
     print(f"  S&P 500 Total Return          : {sp500_total:+.2%}")
     print(f"  Random Baseline Mean Return   : {sigma_result['random_mean']:+.2%}")
-    print(f"  Random Baseline Std           : {sigma_result['random_std']:.4f}")
     print(f"  Z-Score vs Random             : {sigma_result['z_score']:.2f}σ")
     print(f"  P-Value                       : {sigma_result['p_value']:.4f}")
     print(f"  Passes 3-Sigma Test           : {'YES ✓' if sigma_result['passes_3sigma'] else 'NO ✗'}")
+    print("-" * 60)
+    print("RISK METRICS (Strategy vs S&P 500)")
+    print(f"  Annualised Return  : {risk.get('annualised_return', 0):+.2%}  vs  {sp500_risk.get('annualised_return', 0):+.2%}")
+    print(f"  Sharpe Ratio       : {risk.get('sharpe_ratio', 0):.3f}  vs  {sp500_risk.get('sharpe_ratio', 0):.3f}")
+    print(f"  Max Drawdown       : {risk.get('max_drawdown', 0):+.2%}  vs  {sp500_risk.get('max_drawdown', 0):+.2%}")
+    print(f"  Calmar Ratio       : {risk.get('calmar_ratio', float('nan')):.3f}")
+    print(f"  Win Rate           : {risk.get('win_rate', 0):.1%}")
+    print(f"  Profit Factor      : {risk.get('profit_factor', float('nan')):.3f}")
+    print("-" * 60)
+    if not ticker_breakdown.empty:
+        print("PER-TICKER BREAKDOWN (top contributors)")
+        print(f"  {'Ticker':<8} {'Picked':>6} {'WinRate':>8} {'MeanRet':>9} {'Contrib%':>9}")
+        for _, row in ticker_breakdown.head(10).iterrows():
+            print(f"  {row['ticker']:<8} {int(row['times_picked']):>6} "
+                  f"{row['win_rate']:>8.1%} {row['mean_return']:>+9.4%} "
+                  f"{row['contribution_pct']:>+8.1f}%")
     print("=" * 60)
 
     if plot:
-        _plot_results(top3_cum, sp500_cum, random_cum, sigma_result, save_path=save_plot)
+        _plot_results(top3_cum, sp500_cum, random_cum, sigma_result, risk_metrics=risk, save_path=save_plot)
         _plot_decision_log(selections_df, tickers, sector_map, save_path=save_decision_log)
 
+    if export:
+        # selections CSV
+        sel_out = selections_df.copy()
+        sel_out["date"] = sel_out["date"].astype(str)
+        sel_out.to_csv("backtest_selections.csv", index=False)
+        print("[Backtest] Selections saved to backtest_selections.csv")
+
+        # daily returns CSV
+        returns_df = pd.DataFrame({
+            "date": top3_daily.index.astype(str),
+            "strategy_daily_return": top3_daily.values,
+        })
+        sp500_aligned = sp500_daily.reindex(top3_daily.index, method="nearest")
+        returns_df["sp500_daily_return"] = sp500_aligned.values
+        returns_df.to_csv("backtest_daily_returns.csv", index=False)
+        print("[Backtest] Daily returns saved to backtest_daily_returns.csv")
+
+        # summary JSON
+        def _safe(v):
+            if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                return None
+            if isinstance(v, (np.integer, np.floating)):
+                return float(v)
+            return v
+
+        summary = {
+            "total_return":      _safe(top3_total),
+            "sp500_total_return": _safe(sp500_total),
+            "sigma_test": {k: _safe(v) for k, v in sigma_result.items() if k != "_random_totals"},
+            "risk_metrics": {k: _safe(v) for k, v in risk.items()},
+            "sp500_risk_metrics": {k: _safe(v) for k, v in sp500_risk.items()},
+            "ticker_breakdown": ticker_breakdown.to_dict("records") if not ticker_breakdown.empty else [],
+        }
+        with open("backtest_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        print("[Backtest] Summary saved to backtest_summary.json")
+
     return {
-        "predictions":       preds_df,
-        "selections":        selections_df,
-        "top3_daily":        top3_daily,
-        "top3_cumulative":   top3_cum,
-        "sp500_daily":       sp500_daily,
-        "sp500_cumulative":  sp500_cum,
-        "random_daily":      random_daily,
-        "random_cumulative": random_cum,
-        "top3_total_return": top3_total,
+        "predictions":        preds_df,
+        "selections":         selections_df,
+        "top3_daily":         top3_daily,
+        "top3_cumulative":    top3_cum,
+        "sp500_daily":        sp500_daily,
+        "sp500_cumulative":   sp500_cum,
+        "random_daily":       random_daily,
+        "random_cumulative":  random_cum,
+        "top3_total_return":  top3_total,
         "sp500_total_return": sp500_total,
-        "random_totals":     random_totals,
-        "sigma_test":        sigma_result,
+        "random_totals":      random_totals,
+        "sigma_test":         sigma_result,
+        "risk_metrics":       risk,
+        "sp500_risk_metrics": sp500_risk,
+        "ticker_breakdown":   ticker_breakdown,
     }
 
 
@@ -429,52 +579,161 @@ def _plot_results(
     sp500_cum: pd.Series,
     random_cum: pd.DataFrame,
     sigma_result: dict,
-    save_path: str = "backtest_results.png",
+    risk_metrics: "dict | None" = None,
+    save_path: str = "backtest_results.html",
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import webbrowser, os
 
-    ax = axes[0]
-    for col in random_cum.columns:
-        ax.plot(random_cum.index, random_cum[col], color="grey", alpha=0.05, linewidth=0.5)
-    ax.plot(random_cum.index, random_cum.mean(axis=1), color="grey",
-            linewidth=1.5, linestyle="--", label="Random baseline (mean)")
-    sp500_aligned = sp500_cum.reindex(random_cum.index, method="ffill")
-    ax.plot(sp500_aligned.index, sp500_aligned.values, color="blue",
-            linewidth=2, label="S&P 500 (buy & hold)")
-    top3_aligned = top3_cum.reindex(random_cum.index, method="ffill")
-    ax.plot(top3_aligned.index, top3_aligned.values, color="green",
-            linewidth=2.5, label="Top-3 Strategy (sector-diversified)")
-    ax.set_title("Cumulative Returns")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Portfolio Value (starting at 1.0)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    idx           = random_cum.index
+    sp500_aligned = sp500_cum.reindex(idx, method="ffill")
+    top3_aligned  = top3_cum.reindex(idx, method="ffill")
+    rand_mean     = random_cum.mean(axis=1)
 
-    ax2 = axes[1]
-    random_totals = sigma_result.get("_random_totals", random_cum.iloc[-1].values - 1)
-    ax2.hist(random_totals, bins=50, color="grey", alpha=0.7, edgecolor="white",
-             label="Random simulations")
+    def _dd(s): return (s - s.cummax()) / s.cummax()
+
+    dd_top3  = _dd(top3_aligned)
+    dd_sp500 = _dd(sp500_aligned)
+
+    rm           = risk_metrics or {}
+    z            = sigma_result["z_score"]
+    pv           = sigma_result["p_value"]
     strategy_ret = sigma_result["strategy_return"]
-    ax2.axvline(strategy_ret, color="green", linewidth=2.5,
-                label=f"Top-3 ({strategy_ret:+.2%})")
-    ax2.axvline(sigma_result["random_mean"], color="grey", linewidth=1.5, linestyle="--",
-                label=f"Random mean ({sigma_result['random_mean']:+.2%})")
-    threshold = sigma_result["random_mean"] + 3 * sigma_result["random_std"]
-    ax2.axvline(threshold, color="red", linewidth=1.5, linestyle=":",
-                label=f"3σ threshold ({threshold:+.2%})")
-    ax2.set_title(
-        f"Strategy vs Random Distribution\n"
-        f"(Z={sigma_result['z_score']:.2f}σ, p={sigma_result['p_value']:.4f})"
-    )
-    ax2.set_xlabel("Total Return")
-    ax2.set_ylabel("Frequency")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    rand_mu      = sigma_result["random_mean"]
+    rand_sd      = sigma_result["random_std"]
+    threshold    = rand_mu + 3 * rand_sd
+    random_totals = sigma_result.get("_random_totals", random_cum.iloc[-1].values - 1)
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    print(f"[Backtest] Plot saved to {save_path}")
-    plt.show()
+    fig = make_subplots(
+        rows=2, cols=2,
+        specs=[[{"colspan": 2}, None], [{}, {}]],
+        subplot_titles=(
+            "Cumulative Returns",
+            "Drawdown",
+            f"3σ Test  —  Z = {z:.2f}  p = {pv:.4f}",
+        ),
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08,
+    )
+
+    # ── Panel 1: Cumulative returns ──────────────────────────────────────────
+    # Random sims (thin, low opacity)
+    for col in random_cum.columns[:200]:   # cap at 200 traces for perf
+        fig.add_trace(go.Scatter(
+            x=idx, y=random_cum[col],
+            mode="lines", line=dict(color="rgba(160,160,160,0.06)", width=0.5),
+            showlegend=False, hoverinfo="skip",
+        ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=idx, y=rand_mean,
+        mode="lines", name="Random baseline (mean)",
+        line=dict(color="#aaaaaa", width=1.5, dash="dash"),
+        hovertemplate="%{x|%b %d %Y}<br>%{y:.3f}<extra>Random mean</extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=idx, y=sp500_aligned,
+        mode="lines", name="S&P 500 (buy & hold)",
+        line=dict(color="#4c9be8", width=2),
+        hovertemplate="%{x|%b %d %Y}<br>%{y:.3f}<extra>S&P 500</extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=idx, y=top3_aligned,
+        mode="lines", name="Top-3 Strategy",
+        line=dict(color="#4cdd80", width=2.5),
+        hovertemplate="%{x|%b %d %Y}<br>%{y:.3f}<extra>Top-3 Strategy</extra>",
+    ), row=1, col=1)
+
+    # Fill between strategy and S&P 500
+    fig.add_trace(go.Scatter(
+        x=list(idx) + list(idx[::-1]),
+        y=list(top3_aligned) + list(sp500_aligned[::-1]),
+        fill="toself",
+        fillcolor="rgba(76,221,128,0.08)",
+        line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False, hoverinfo="skip",
+    ), row=1, col=1)
+
+    # Metrics annotation
+    sharpe_str = f"{rm.get('sharpe_ratio', float('nan')):.2f}" if rm else "—"
+    maxdd_str  = f"{rm.get('max_drawdown', float('nan')):.1%}"  if rm else "—"
+    fig.add_annotation(
+        xref="x domain", yref="y domain", x=0.01, y=0.97,
+        text=f"<b>Sharpe: {sharpe_str}   Max DD: {maxdd_str}</b>",
+        showarrow=False, font=dict(size=11, color="#cccccc"),
+        bgcolor="rgba(30,30,30,0.75)", bordercolor="#555", borderwidth=1,
+        row=1, col=1,
+    )
+
+    # ── Panel 2: Drawdown ────────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=idx, y=dd_sp500 * 100,
+        mode="lines", name="S&P 500 DD",
+        line=dict(color="#4c9be8", width=1.5),
+        fill="tozeroy", fillcolor="rgba(76,155,232,0.1)",
+        hovertemplate="%{x|%b %d %Y}<br>%{y:.2f}%<extra>S&P 500</extra>",
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=idx, y=dd_top3 * 100,
+        mode="lines", name="Strategy DD",
+        line=dict(color="#4cdd80", width=1.5),
+        fill="tozeroy", fillcolor="rgba(76,221,128,0.1)",
+        hovertemplate="%{x|%b %d %Y}<br>%{y:.2f}%<extra>Strategy</extra>",
+    ), row=2, col=1)
+
+    # ── Panel 3: Z-Score distribution ───────────────────────────────────────
+    fig.add_trace(go.Histogram(
+        x=random_totals * 100,
+        nbinsx=50,
+        name="Random simulations",
+        marker_color="#4c9be8",
+        opacity=0.6,
+        hovertemplate="Return: %{x:.1f}%<br>Count: %{y}<extra></extra>",
+    ), row=2, col=2)
+
+    for val, color, label in [
+        (strategy_ret * 100, "#4cdd80", f"Strategy ({strategy_ret:+.2%})"),
+        (rand_mu * 100,      "#aaaaaa", f"Random mean ({rand_mu:+.2%})"),
+        (threshold * 100,    "#e87c4c", f"3σ threshold ({threshold:+.2%})"),
+    ]:
+        fig.add_vline(x=val, line_color=color, line_width=2,
+                      annotation_text=label, annotation_font_color=color,
+                      annotation_position="top right",
+                      row=2, col=2)
+
+    # ── Layout ───────────────────────────────────────────────────────────────
+    final_top3  = top3_aligned.iloc[-1]
+    final_sp500 = sp500_aligned.iloc[-1]
+    passes = "✓ PASSES" if sigma_result.get("passes_3sigma") else "✗ FAILS"
+
+    fig.update_layout(
+        template="plotly_dark",
+        title=dict(
+            text=f"Backtest Results — Strategy {final_top3-1:+.1%} vs S&P 500 {final_sp500-1:+.1%} — 3σ Test: {passes}",
+            font=dict(size=16),
+        ),
+        height=750,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(family="Inter, system-ui, sans-serif"),
+        paper_bgcolor="#111",
+        plot_bgcolor="#111",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.07)", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.07)", zeroline=False)
+    fig.update_yaxes(ticksuffix="%", row=2, col=1)
+    fig.update_yaxes(title_text="Portfolio Value (1.0 = start)", row=1, col=1)
+    fig.update_yaxes(title_text="Drawdown (%)",  row=2, col=1)
+    fig.update_yaxes(title_text="Frequency",     row=2, col=2)
+    fig.update_xaxes(title_text="Total Return (%)", row=2, col=2)
+
+    save_path = save_path.replace(".png", ".html")
+    fig.write_html(save_path, include_plotlyjs="cdn")
+    print(f"[Backtest] Interactive plot saved to {save_path}")
+    webbrowser.open(f"file://{os.path.abspath(save_path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -485,118 +744,142 @@ def _plot_decision_log(
     selections_df: pd.DataFrame,
     all_tickers: list[str],
     sector_map: dict[str, str],
-    save_path: str = "decision_log.png",
+    save_path: str = "decision_log.html",
 ) -> None:
-    """3-panel figure showing which stocks were picked, horizons used, and sector allocation."""
-    import matplotlib.colors as mcolors
+    """3-panel interactive chart: stock heatmap, horizon usage, sector allocation."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import webbrowser, os
 
     if selections_df.empty:
         print("[Backtest] No selections to plot in decision log.")
         return
 
-    # Horizon encoding
-    horizon_order = ["out_1d", "out_5d", "out_21d", "out_126d"]
-    horizon_code  = {h: i + 1 for i, h in enumerate(horizon_order)}
-    horizon_label = {"out_1d": "1d", "out_5d": "5d", "out_21d": "21d", "out_126d": "126d"}
+    horizon_order  = [f"out_{h}d" for h in HORIZONS]
+    horizon_label  = {f"out_{h}d": f"{h}d" for h in HORIZONS}
+    horizon_palette = ["#084c61", "#4c9be8", "#a8d5f5", "#f5c842", "#e87c4c"]
+    horizon_colors  = {h: horizon_palette[i] for i, h in enumerate(horizon_order)}
 
-    # Sort tickers by sector for heatmap columns
     tickers_sorted = sorted(all_tickers, key=lambda t: (sector_map.get(t, t), t))
-
-    # Unique dates
-    all_dates = sorted(selections_df["date"].unique())
-    n_dates   = len(all_dates)
-    date_idx  = {d: i for i, d in enumerate(all_dates)}
-
-    # Build heatmap matrix
-    matrix = np.zeros((n_dates, len(tickers_sorted)), dtype=float)
-    for _, row in selections_df.iterrows():
-        r = date_idx.get(row["date"])
-        c = tickers_sorted.index(row["ticker"]) if row["ticker"] in tickers_sorted else None
-        if r is not None and c is not None:
-            matrix[r, c] = horizon_code.get(row["best_horizon"], 1)
-
-    fig, axes = plt.subplots(3, 1, figsize=(18, 14))
-
-    # --- Panel 1: Heatmap ---
-    ax1 = axes[0]
-    cmap = mcolors.ListedColormap(["white", "#084c61", "#4c9be8", "#a8d5f5", "#f5c842"])
-    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
-    norm   = mcolors.BoundaryNorm(bounds, cmap.N)
-
-    # Sample y-axis labels for readability
-    y_labels = [""] * n_dates
-    step = max(1, n_dates // 30)
-    for i in range(0, n_dates, step):
-        y_labels[i] = str(all_dates[i].date()) if hasattr(all_dates[i], "date") else str(all_dates[i])
-
-    im = ax1.imshow(matrix, aspect="auto", cmap=cmap, norm=norm, interpolation="nearest")
-    ax1.set_xticks(range(len(tickers_sorted)))
-    ax1.set_xticklabels(tickers_sorted, rotation=45, ha="right", fontsize=8)
-    ax1.set_yticks(range(n_dates))
-    ax1.set_yticklabels(y_labels, fontsize=7)
-    ax1.set_title("Daily Stock Selections by Horizon")
-
-    # Vertical dashed lines between sectors
-    prev_sector = None
-    for c_idx, ticker in enumerate(tickers_sorted):
-        sec = sector_map.get(ticker, ticker)
-        if prev_sector is not None and sec != prev_sector:
-            ax1.axvline(x=c_idx - 0.5, color="black", linewidth=1.2, linestyle="--", alpha=0.6)
-        prev_sector = sec
-
-    cbar = fig.colorbar(im, ax=ax1, orientation="vertical", pad=0.01)
-    cbar.set_ticks([0, 1, 2, 3, 4])
-    cbar.set_ticklabels(["not picked", "1d", "5d", "21d", "126d"])
-
-    # --- Panel 2: Horizon usage over time (weekly stacked bar) ---
-    ax2 = axes[1]
-    horizon_colors = {"out_1d": "#084c61", "out_5d": "#4c9be8", "out_21d": "#a8d5f5", "out_126d": "#f5c842"}
 
     sel = selections_df.copy()
     sel["date"] = pd.to_datetime(sel["date"])
+
+    # ── Panel 1: Heatmap (date × ticker, coloured by horizon) ───────────────
+    all_dates = sorted(sel["date"].unique())
+    date_strs = [str(pd.Timestamp(d).date()) for d in all_dates]
+    date_idx  = {d: i for i, d in enumerate(all_dates)}
+    ticker_idx = {t: i for i, t in enumerate(tickers_sorted)}
+
+    n_h = len(horizon_order)
+    # 0 = not picked; 1…n_h = horizon index+1
+    z_matrix    = np.zeros((len(all_dates), len(tickers_sorted)), dtype=int)
+    hover_matrix = [[""] * len(tickers_sorted) for _ in range(len(all_dates))]
+
+    for _, row in sel.iterrows():
+        r = date_idx.get(row["date"])
+        c = ticker_idx.get(row["ticker"])
+        if r is not None and c is not None:
+            code = horizon_order.index(row["best_horizon"]) + 1 if row["best_horizon"] in horizon_order else 1
+            z_matrix[r, c] = code
+            ret_str = f"  ret={row['pick_return']:+.2%}" if "pick_return" in row and pd.notna(row.get("pick_return")) else ""
+            hover_matrix[r][c] = (
+                f"<b>{row['ticker']}</b><br>"
+                f"Date: {str(pd.Timestamp(row['date']).date())}<br>"
+                f"Horizon: {horizon_label.get(row['best_horizon'], row['best_horizon'])}<br>"
+                f"P(up): {row['best_prob_up']:.1%}<br>"
+                f"Score: {row['best_score']:.4f}{ret_str}"
+            )
+
+    colorscale = [[i / n_h, c] for i, c in enumerate(["#1e1e1e"] + horizon_palette[:n_h])]
+    colorscale[-1][0] = 1.0
+
+    heatmap = go.Heatmap(
+        z=z_matrix,
+        x=tickers_sorted,
+        y=date_strs,
+        colorscale=colorscale,
+        zmin=0, zmax=n_h,
+        text=hover_matrix,
+        hovertemplate="%{text}<extra></extra>",
+        showscale=True,
+        colorbar=dict(
+            tickvals=list(range(n_h + 1)),
+            ticktext=["—"] + [horizon_label[h] for h in horizon_order],
+            title="Horizon",
+            thickness=12,
+        ),
+    )
+
+    # ── Panel 2: Weekly horizon usage (stacked bar) ──────────────────────────
     for h in horizon_order:
         sel[h] = (sel["best_horizon"] == h).astype(int)
-
     weekly_h = sel.set_index("date")[horizon_order].resample("W").sum()
 
-    bottom = np.zeros(len(weekly_h))
+    horizon_bars = []
     for h in horizon_order:
-        ax2.bar(weekly_h.index, weekly_h[h], bottom=bottom,
-                label=horizon_label[h], color=horizon_colors[h], width=5)
-        bottom += weekly_h[h].values
+        horizon_bars.append(go.Bar(
+            x=weekly_h.index, y=weekly_h[h],
+            name=horizon_label[h],
+            marker_color=horizon_colors[h],
+            hovertemplate=f"Week %{{x|%b %d '%y}}<br>{horizon_label[h]}: %{{y}} picks<extra></extra>",
+        ))
 
-    ax2.set_title("Horizon Usage Over Time")
-    ax2.set_xlabel("Date")
-    ax2.set_ylabel("Pick Count")
-    ax2.legend(loc="upper right", fontsize=8)
-    ax2.grid(True, alpha=0.3)
-
-    # --- Panel 3: Sector allocation over time (weekly stacked bar) ---
-    ax3 = axes[2]
-    sectors_all = sorted(selections_df["sector"].unique())
-    sector_colors = plt.cm.tab10(np.linspace(0, 1, len(sectors_all)))
-
+    # ── Panel 3: Weekly sector allocation (stacked bar) ──────────────────────
+    sector_totals = {sec: int((sel["sector"] == sec).sum()) for sec in sel["sector"].unique()}
+    sectors_all   = sorted(sector_totals, key=lambda s: -sector_totals[s])
+    tab20 = [
+        "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+        "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf",
+    ]
     for col in sectors_all:
         sel[col] = (sel["sector"] == col).astype(int)
-
     weekly_s = sel.set_index("date")[sectors_all].resample("W").sum()
 
-    bottom = np.zeros(len(weekly_s))
+    sector_bars = []
     for i, sec in enumerate(sectors_all):
-        ax3.bar(weekly_s.index, weekly_s[sec], bottom=bottom,
-                label=sec, color=sector_colors[i], width=5)
-        bottom += weekly_s[sec].values
+        sector_bars.append(go.Bar(
+            x=weekly_s.index, y=weekly_s[sec],
+            name=f"{sec} ({sector_totals[sec]})",
+            marker_color=tab20[i % len(tab20)],
+            hovertemplate=f"Week %{{x|%b %d '%y}}<br>{sec}: %{{y}} picks<extra></extra>",
+        ))
 
-    ax3.set_title("Sector Allocation Over Time")
-    ax3.set_xlabel("Date")
-    ax3.set_ylabel("Pick Count")
-    ax3.legend(loc="upper right", fontsize=8, ncol=2)
-    ax3.grid(True, alpha=0.3)
+    # ── Assemble figure ──────────────────────────────────────────────────────
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=("Daily Stock Selections by Horizon", "Horizon Usage Over Time", "Sector Allocation Over Time"),
+        row_heights=[0.55, 0.225, 0.225],
+        vertical_spacing=0.07,
+    )
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    print(f"[Backtest] Decision log saved to {save_path}")
-    plt.show()
+    fig.add_trace(heatmap, row=1, col=1)
+    for bar in horizon_bars:
+        bar.showlegend = True
+        fig.add_trace(bar, row=2, col=1)
+    for bar in sector_bars:
+        bar.showlegend = True
+        fig.add_trace(bar, row=3, col=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        title="Decision Log — Daily Selections, Horizon & Sector Breakdown",
+        height=1100,
+        barmode="stack",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+        font=dict(family="Inter, system-ui, sans-serif"),
+        paper_bgcolor="#111",
+        plot_bgcolor="#111",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.07)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.07)")
+    fig.update_yaxes(title_text="Pick Count", row=2, col=1)
+    fig.update_yaxes(title_text="Pick Count", row=3, col=1)
+
+    save_path = save_path.replace(".png", ".html")
+    fig.write_html(save_path, include_plotlyjs="cdn")
+    print(f"[Backtest] Interactive decision log saved to {save_path}")
+    webbrowser.open(f"file://{os.path.abspath(save_path)}")
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +904,7 @@ if __name__ == "__main__":
     parser.add_argument("--sims",           type=int,   default=1000)
     parser.add_argument("--model",          default=None)
     parser.add_argument("--no-plot",        action="store_true")
+    parser.add_argument("--no-export",      action="store_true")
     args = parser.parse_args()
 
     if args.model:
@@ -647,4 +931,5 @@ if __name__ == "__main__":
         lambda_penalty=args.lambda_penalty,
         n_random_sims=args.sims,
         plot=not args.no_plot,
+        export=not args.no_export,
     )

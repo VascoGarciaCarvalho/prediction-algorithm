@@ -8,13 +8,26 @@ Phase 3: Legitimate training (200 epochs, no future data)
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-from data_engineering import build_dataset, FEATURE_COLS
+from sklearn.utils.class_weight import compute_class_weight
+from data_engineering import build_dataset, FEATURE_COLS, HORIZONS
 from model import build_model, print_model_summary
 
 
 # ---------------------------------------------------------------------------
 # Shared Training Helper
 # ---------------------------------------------------------------------------
+
+def _compute_sample_weights(y_train: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Compute per-sample balanced class weights for each output head."""
+    sample_weights = {}
+    for h in HORIZONS:
+        key = f"out_{h}d"
+        y_arr = y_train[key].astype(int)
+        classes = np.array([0, 1])
+        cw = compute_class_weight("balanced", classes=classes, y=y_arr)
+        sample_weights[key] = np.where(y_arr == 1, cw[1], cw[0])
+    return sample_weights
+
 
 def _train(
     model: keras.Model,
@@ -25,6 +38,7 @@ def _train(
     epochs: int,
     batch_size: int = 64,
     use_early_stopping: bool = False,
+    sample_weights: "dict[str, np.ndarray] | None" = None,
     verbose: int = 1,
 ) -> keras.callbacks.History:
     callbacks = []
@@ -60,6 +74,7 @@ def _train(
         batch_size=batch_size,
         validation_data=(X_test, y_test),
         callbacks=callbacks,
+        sample_weight=sample_weights,
         verbose=verbose,
     )
     return history
@@ -176,10 +191,13 @@ def run_phase3(
     model = build_model(input_shape=(window_size, n_features))
     print_model_summary(model)
 
+    sample_weights = _compute_sample_weights(y_train)
+
     history = _train(
         model, X_train, y_train, X_test, y_test,
         epochs=epochs, batch_size=batch_size,
         use_early_stopping=True,
+        sample_weights=sample_weights,
     )
 
     _evaluate(model, X_test, y_test, phase=3)

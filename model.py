@@ -66,9 +66,13 @@ def build_model(
     x = layers.BatchNormalization(name="bn_conv")(x)
     x = MCDropout(rate=dropout_rate, name="mc_dropout_conv")(x)
 
-    x = layers.LSTM(units=lstm_units, return_sequences=False, name="lstm")(x)
-    x = layers.BatchNormalization(name="bn_lstm")(x)
-    x = MCDropout(rate=dropout_rate, name="mc_dropout_lstm")(x)
+    x = layers.LSTM(units=lstm_units, return_sequences=True, name="lstm1")(x)
+    x = layers.BatchNormalization(name="bn_lstm1")(x)
+    x = MCDropout(rate=dropout_rate, name="mc_dropout_lstm1")(x)
+
+    x = layers.LSTM(units=lstm_units // 2, return_sequences=False, name="lstm2")(x)
+    x = layers.BatchNormalization(name="bn_lstm2")(x)
+    x = MCDropout(rate=dropout_rate, name="mc_dropout_lstm2")(x)
 
     # --- One sigmoid head per horizon ---
     outputs = {
@@ -85,7 +89,6 @@ def build_model(
             "out_1d":   1.00,   # ~252 independent samples/year
             "out_5d":   1.00,   # ~50 independent samples/year
             "out_21d":  0.50,   # ~12 independent samples/year
-            "out_126d": 0.25,   # ~2 independent samples/year
         },
         metrics={f"out_{h}d": ["accuracy"] for h in HORIZONS},
     )
